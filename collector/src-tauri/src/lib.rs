@@ -1,7 +1,9 @@
 mod commands;
-mod ssh_collector;
 mod db_collector;
+mod deployment;
 mod diagnosis;
+mod ssh_collector;
+mod validator;
 
 use commands::*;
 
@@ -15,17 +17,27 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(AppState {
+            manifest: std::sync::Mutex::new(None),
             config: std::sync::Mutex::new(None),
+            validated: std::sync::Mutex::new(false),
         })
         .invoke_handler(tauri::generate_handler![
-            load_config,
+            // 第一步：部署文档导入
+            generate_service_template,
+            generate_db_template,
+            export_template,
+            import_service_csv,
+            import_db_csv,
+            set_site_info,
+            // 第二步：校验
+            validate_services,
+            validate_single_service,
+            validate_databases,
+            confirm_validation,
+            // 第三步：采集
             resolve_request_url,
-            resolve_batch_urls,
-            test_ssh_connection,
-            list_remote_log_files,
-            test_db_connection,
             start_diagnosis,
-            get_diagnosis_status,
+            get_config_summary,
         ])
         .run(tauri::generate_context!())
         .expect("收集端启动失败");
