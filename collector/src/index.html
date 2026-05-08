@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智慧诊断 - 问题收集端</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="header-brand">
+        <span class="header-icon">🔍</span>
+        <h1>智慧诊断 · 问题收集端</h1>
+      </div>
+      <span class="header-version">v0.1.0</span>
+    </header>
+
+    <main class="main">
+      <!-- Step 1: 配置 -->
+      <section class="card" id="config-section">
+        <h2>⚙️ 环境配置</h2>
+        <div class="form-row">
+          <label>配置文件路径</label>
+          <input type="text" id="config-path" placeholder="C:\diagnosis\collector.toml" />
+          <button id="btn-load-config" class="btn btn-secondary">加载配置</button>
+        </div>
+        <div id="config-status" class="status-msg"></div>
+      </section>
+
+      <!-- Step 2: 输入页面 URL -->
+      <section class="card" id="url-section">
+        <h2>🌐 诊断目标</h2>
+        <div class="form-row">
+          <label>页面 URL</label>
+          <input type="text" id="page-url"
+            placeholder="http://172.29.60.151/patient-management" />
+          <button id="btn-open-browser" class="btn btn-primary">打开诊断浏览器</button>
+        </div>
+        <p class="hint">输入出问题的页面地址，工具会在内嵌浏览器中打开并捕获所有接口请求。</p>
+      </section>
+
+      <!-- Step 3: 捕获结果 -->
+      <section class="card" id="capture-section" style="display:none">
+        <h2>📡 请求捕获</h2>
+        <div class="capture-toolbar">
+          <span id="capture-count">已捕获 <strong>0</strong> 个请求</span>
+          <button id="btn-stop-capture" class="btn btn-warning">⏹ 采集完成</button>
+        </div>
+        <div class="request-list" id="request-list"></div>
+      </section>
+
+      <!-- Step 4: 诊断进度 -->
+      <section class="card" id="diagnosis-section" style="display:none">
+        <h2>🔬 诊断进度</h2>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+        </div>
+        <div class="progress-steps" id="progress-steps">
+          <div class="step" data-step="parse">📋 解析请求</div>
+          <div class="step" data-step="ssh">🔗 SSH 采集日志</div>
+          <div class="step" data-step="sql">🗄️ 查询慢 SQL</div>
+          <div class="step" data-step="mask">🔒 隐私脱敏</div>
+          <div class="step" data-step="pack">📦 打包诊断包</div>
+        </div>
+        <div id="diagnosis-status" class="status-msg"></div>
+      </section>
+
+      <!-- Step 5: 结果 -->
+      <section class="card" id="result-section" style="display:none">
+        <h2>✅ 诊断包已生成</h2>
+        <div class="result-info">
+          <p>📁 文件路径: <code id="result-path"></code></p>
+          <button id="btn-open-folder" class="btn btn-primary">📂 打开所在目录</button>
+          <button id="btn-new-diagnosis" class="btn btn-secondary">🔄 新建诊断</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

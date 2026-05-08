@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "Smart Diag Collector",
+  "version": "0.1.0",
+  "identifier": "com.iflytek.smart-diag-collector",
+  "build": {
+    "frontendDist": "../src/"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "智慧诊断 - 问题收集端",
+        "width": 1000,
+        "height": 800,
+        "center": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": [],
+    "icon": []
+  }
+}

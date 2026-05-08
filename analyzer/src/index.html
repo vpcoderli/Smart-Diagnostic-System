@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智慧诊断 - 问题分析端</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="header-brand">
+        <span class="header-icon">🔬</span>
+        <h1>智慧诊断 · 问题分析端</h1>
+      </div>
+      <span class="header-version">v0.1.0</span>
+    </header>
+
+    <main class="main">
+      <!-- 导入面板 -->
+      <section class="card" id="import-section">
+        <h2>📦 导入诊断包</h2>
+        <div class="drop-zone" id="drop-zone">
+          <span class="drop-icon">📁</span>
+          <p>拖入 diagnosis.zip 或点击选择文件</p>
+          <input type="file" id="file-input" accept=".zip" hidden />
+        </div>
+        <div class="form-row" style="margin-top:12px">
+          <input type="text" id="zip-path" placeholder="或直接输入诊断包路径..." />
+          <button id="btn-import" class="btn btn-primary">导入分析</button>
+        </div>
+      </section>
+
+      <!-- 诊断概要 -->
+      <section class="card" id="summary-section" style="display:none">
+        <h2>📋 诊断概要</h2>
+        <div class="summary-grid" id="summary-grid"></div>
+      </section>
+
+      <!-- 证据仪表盘 -->
+      <section class="dashboard" id="dashboard" style="display:none">
+        <div class="card panel">
+          <h2>🌐 请求概览</h2>
+          <div id="request-panel"></div>
+        </div>
+        <div class="card panel">
+          <h2>📝 日志摘要</h2>
+          <div id="log-panel"></div>
+        </div>
+        <div class="card panel">
+          <h2>🗄️ SQL 分析</h2>
+          <div id="sql-panel"></div>
+        </div>
+      </section>
+
+      <!-- 诊断结论 -->
+      <section class="card" id="findings-section" style="display:none">
+        <h2>🎯 诊断结论</h2>
+        <div id="findings-list"></div>
+      </section>
+
+      <!-- 报告 -->
+      <section class="card" id="report-section" style="display:none">
+        <div class="report-header">
+          <h2>📄 诊断报告</h2>
+          <div>
+            <button id="btn-copy-report" class="btn btn-secondary">📋 复制</button>
+            <button id="btn-export-report" class="btn btn-primary">💾 导出</button>
+          </div>
+        </div>
+        <div class="report-preview" id="report-preview"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
