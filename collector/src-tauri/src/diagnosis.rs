@@ -44,9 +44,8 @@ impl DiagnosisRunner {
             }
         }
 
-        // Step 3: 查询慢 SQL（MVP 先跳过实际 DB 连接，后续实现）
-        let slow_sqls: Vec<SlowSqlItem> = Vec::new();
-        let table_stats: Vec<TableStats> = Vec::new();
+        // Step 3: 查询慢 SQL + 表统计
+        let (slow_sqls, table_stats) = self.collect_db_data().await;
 
         // Step 4: 构建诊断包
         let now = Utc::now();
@@ -196,5 +195,24 @@ impl DiagnosisRunner {
         }
 
         Ok(all_entries)
+    }
+
+    /// 采集数据库慢 SQL 和表统计
+    async fn collect_db_data(&self) -> (Vec<SlowSqlItem>, Vec<TableStats>) {
+        let collector = crate::db_collector::DbCollector::new(self.config.database.clone());
+        match collector.collect().await {
+            Ok((sqls, stats)) => {
+                tracing::info!(
+                    "数据库采集完成: {} 条慢 SQL, {} 张表统计",
+                    sqls.len(),
+                    stats.len()
+                );
+                (sqls, stats)
+            }
+            Err(e) => {
+                tracing::warn!("数据库采集失败（跳过）: {}", e);
+                (Vec::new(), Vec::new())
+            }
+        }
     }
 }

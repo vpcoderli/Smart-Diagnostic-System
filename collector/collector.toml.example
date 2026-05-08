@@ -1,0 +1,117 @@
+# Smart Diagnostic System - 收集端配置
+# 请根据实际部署环境修改此文件
+
+[site]
+name = "hospital-a"
+system = "pcm"
+
+[gateway]
+prefix = "/gateway"
+
+# ─── SSH 配置（用于远程访问 Linux 服务器采集日志）───
+[ssh]
+port = 22
+username = "deploy"
+auth_type = "password"  # "password" 或 "key"
+# private_key = "C:\\Users\\admin\\.ssh\\id_rsa"  # key 模式使用
+password = "your_ssh_password"  # password 模式使用
+
+# ─── 数据库配置（用于查询慢 SQL）───
+[database]
+type = "mysql"
+host = "172.29.60.100"
+port = 3306
+username = "readonly"
+password = "readonly_password"
+database = "pcm_db"
+
+# ─── 隐私脱敏配置 ───
+[privacy]
+mask_query_values = true
+allowed_query_keys = ["pageNum", "pageSize", "portal", "type", "status"]
+
+# ─── 收集端设置 ───
+[collector]
+time_window_minutes = 30
+max_log_lines = 500
+output_dir = "C:\\diagnosis\\output"
+
+# ─── 服务映射配置 ───
+# 每个服务指定其部署的服务器 IP 和日志路径
+
+[[services]]
+name = "pcm-server"
+display = "患者管理服务"
+hosts = ["172.29.60.10"]
+log_dir = "/opt/pcm/pcm-server/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-followup"
+display = "随访服务"
+hosts = ["172.29.60.11"]
+log_dir = "/opt/pcm/pcm-followup/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-communication"
+display = "会话服务"
+hosts = ["172.29.60.12"]
+log_dir = "/opt/pcm/pcm-communication/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-management"
+display = "业务管理服务"
+hosts = ["172.29.60.13", "172.29.60.14"]
+log_dir = "/opt/pcm/pcm-management/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-profile"
+display = "画像服务"
+hosts = ["172.29.60.15"]
+log_dir = "/opt/pcm/pcm-profile/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-data"
+display = "数据服务"
+hosts = ["172.29.60.16"]
+log_dir = "/opt/pcm/pcm-data/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-statistics"
+display = "数据分析服务"
+hosts = ["172.29.60.17"]
+log_dir = "/opt/pcm/pcm-statistics/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-user"
+display = "用户服务"
+hosts = ["172.29.60.18"]
+log_dir = "/opt/pcm/pcm-user/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-channel"
+display = "通道服务"
+hosts = ["172.29.60.19"]
+log_dir = "/opt/pcm/pcm-channel/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-health-plan"
+display = "健康方案服务"
+hosts = ["172.29.60.20"]
+log_dir = "/opt/pcm/pcm-health-plan/logs/"
+log_pattern = "*.log"
+
+[[services]]
+name = "pcm-open-api"
+display = "外部接口服务"
+hosts = ["172.29.60.21"]
+log_dir = "/opt/pcm/pcm-open-api/logs/"
+log_pattern = "*.log"
