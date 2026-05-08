@@ -16,68 +16,126 @@
       <span class="header-version">v0.1.0</span>
     </header>
 
+    <!-- 步骤指示器 -->
+    <nav class="stepper">
+      <div class="step-item active" data-step="1"><span class="step-num">1</span>导入部署</div>
+      <div class="step-divider"></div>
+      <div class="step-item" data-step="2"><span class="step-num">2</span>连通校验</div>
+      <div class="step-divider"></div>
+      <div class="step-item" data-step="3"><span class="step-num">3</span>问题采集</div>
+    </nav>
+
     <main class="main">
-      <!-- Step 1: 配置 -->
-      <section class="card" id="config-section">
-        <h2>⚙️ 环境配置</h2>
-        <div class="form-row">
-          <label>配置文件路径</label>
-          <input type="text" id="config-path" placeholder="C:\diagnosis\collector.toml" />
-          <button id="btn-load-config" class="btn btn-secondary">加载配置</button>
-        </div>
-        <div id="config-status" class="status-msg"></div>
-      </section>
+      <!-- ═══ Phase 1: 导入部署文档 ═══ -->
+      <div id="phase-1" class="phase">
+        <section class="card">
+          <h2>📋 站点信息</h2>
+          <div class="form-grid">
+            <div class="form-group">
+              <label>医院站点名称</label>
+              <input type="text" id="site-name" placeholder="如: hospital-a" />
+            </div>
+            <div class="form-group">
+              <label>网关前缀</label>
+              <input type="text" id="gateway-prefix" value="/gateway" />
+            </div>
+          </div>
+        </section>
 
-      <!-- Step 2: 输入页面 URL -->
-      <section class="card" id="url-section">
-        <h2>🌐 诊断目标</h2>
-        <div class="form-row">
-          <label>页面 URL</label>
-          <input type="text" id="page-url"
-            placeholder="http://172.29.60.151/patient-management" />
-          <button id="btn-open-browser" class="btn btn-primary">打开诊断浏览器</button>
-        </div>
-        <p class="hint">输入出问题的页面地址，工具会在内嵌浏览器中打开并捕获所有接口请求。</p>
-      </section>
+        <section class="card">
+          <h2>🖥️ 服务部署信息</h2>
+          <p class="hint">导入服务部署 CSV 文件（项目名、服务器IP、用户名、密码、日志路径）</p>
+          <div class="import-area">
+            <button id="btn-dl-svc-tpl" class="btn btn-outline">📥 下载模板</button>
+            <div class="file-drop" id="svc-drop">
+              <input type="file" id="svc-file" accept=".csv" hidden />
+              <span>点击选择或拖入 服务部署.csv</span>
+            </div>
+          </div>
+          <div id="svc-preview" class="preview-table" style="display:none"></div>
+          <div id="svc-status" class="status-msg"></div>
+        </section>
 
-      <!-- Step 3: 捕获结果 -->
-      <section class="card" id="capture-section" style="display:none">
-        <h2>📡 请求捕获</h2>
-        <div class="capture-toolbar">
-          <span id="capture-count">已捕获 <strong>0</strong> 个请求</span>
-          <button id="btn-stop-capture" class="btn btn-warning">⏹ 采集完成</button>
-        </div>
-        <div class="request-list" id="request-list"></div>
-      </section>
+        <section class="card">
+          <h2>🗄️ 数据库信息</h2>
+          <p class="hint">导入数据库部署 CSV 文件（类型、IP、端口、用户名、密码、库名）</p>
+          <div class="import-area">
+            <button id="btn-dl-db-tpl" class="btn btn-outline">📥 下载模板</button>
+            <div class="file-drop" id="db-drop">
+              <input type="file" id="db-file" accept=".csv" hidden />
+              <span>点击选择或拖入 数据库部署.csv</span>
+            </div>
+          </div>
+          <div id="db-preview" class="preview-table" style="display:none"></div>
+          <div id="db-status" class="status-msg"></div>
+        </section>
 
-      <!-- Step 4: 诊断进度 -->
-      <section class="card" id="diagnosis-section" style="display:none">
-        <h2>🔬 诊断进度</h2>
-        <div class="progress-bar">
-          <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+        <div class="action-bar">
+          <button id="btn-to-validate" class="btn btn-primary" disabled>下一步：连通校验 →</button>
         </div>
-        <div class="progress-steps" id="progress-steps">
-          <div class="step" data-step="parse">📋 解析请求</div>
-          <div class="step" data-step="ssh">🔗 SSH 采集日志</div>
-          <div class="step" data-step="sql">🗄️ 查询慢 SQL</div>
-          <div class="step" data-step="mask">🔒 隐私脱敏</div>
-          <div class="step" data-step="pack">📦 打包诊断包</div>
-        </div>
-        <div id="diagnosis-status" class="status-msg"></div>
-      </section>
+      </div>
 
-      <!-- Step 5: 结果 -->
-      <section class="card" id="result-section" style="display:none">
-        <h2>✅ 诊断包已生成</h2>
-        <div class="result-info">
-          <p>📁 文件路径: <code id="result-path"></code></p>
-          <button id="btn-open-folder" class="btn btn-primary">📂 打开所在目录</button>
-          <button id="btn-new-diagnosis" class="btn btn-secondary">🔄 新建诊断</button>
+      <!-- ═══ Phase 2: 连通校验 ═══ -->
+      <div id="phase-2" class="phase" style="display:none">
+        <section class="card">
+          <h2>🔗 服务连通校验</h2>
+          <p class="hint">逐个验证 SSH 连接和日志路径是否可达</p>
+          <div id="svc-validation-list" class="validation-list"></div>
+          <button id="btn-validate-svc" class="btn btn-primary">▶ 开始校验服务</button>
+        </section>
+
+        <section class="card">
+          <h2>🗄️ 数据库连通校验</h2>
+          <div id="db-validation-list" class="validation-list"></div>
+          <button id="btn-validate-db" class="btn btn-primary">▶ 开始校验数据库</button>
+        </section>
+
+        <div class="action-bar">
+          <button id="btn-back-import" class="btn btn-secondary">← 返回修改</button>
+          <button id="btn-to-collect" class="btn btn-primary" disabled>下一步：问题采集 →</button>
         </div>
-      </section>
+      </div>
+
+      <!-- ═══ Phase 3: URL 采集 ═══ -->
+      <div id="phase-3" class="phase" style="display:none">
+        <section class="card">
+          <h2>🌐 诊断目标</h2>
+          <div class="form-group">
+            <label>问题页面 URL</label>
+            <div class="form-row">
+              <input type="text" id="page-url" placeholder="http://172.29.60.151/patient-management" />
+              <button id="btn-open-page" class="btn btn-primary">打开诊断浏览器</button>
+            </div>
+          </div>
+          <p class="hint">输入出问题的页面地址，工具会捕获该页面所有 API 请求。</p>
+        </section>
+
+        <section class="card" id="capture-card" style="display:none">
+          <h2>📡 请求捕获</h2>
+          <div class="capture-toolbar">
+            <span>已捕获 <strong id="capture-count">0</strong> 个请求</span>
+            <button id="btn-stop" class="btn btn-warning">⏹ 采集完成</button>
+          </div>
+          <div id="request-list" class="request-list"></div>
+        </section>
+
+        <section class="card" id="progress-card" style="display:none">
+          <h2>🔬 诊断进度</h2>
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+          <div id="progress-steps" class="progress-steps"></div>
+          <div id="diag-status" class="status-msg"></div>
+        </section>
+
+        <section class="card" id="result-card" style="display:none">
+          <h2>✅ 诊断包已生成</h2>
+          <p>📁 输出路径: <code id="result-path"></code></p>
+          <div class="action-bar" style="margin-top:16px">
+            <button id="btn-new" class="btn btn-secondary">🔄 新建诊断</button>
+          </div>
+        </section>
+      </div>
     </main>
   </div>
-
   <script src="app.js"></script>
 </body>
 </html>
