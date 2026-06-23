@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use diag_core::collector_trait::LogCollector;
 use diag_core::config::CollectorConfig;
-use diag_core::models::{CapturedPage, ResolvedUrl};
+use diag_core::models::{CapturedPage, LogEntry, ResolvedUrl};
 use diag_core::url_resolver;
 use std::sync::{Arc, Mutex};
 use tauri::State;
@@ -686,6 +686,36 @@ fn has_ssh_fallback_config(config: &CollectorConfig) -> bool {
                 .unwrap_or(false))
 }
 
+fn log_matches_text_terms(log: &LogEntry, terms: &[&str]) -> bool {
+    let fields = [
+        log.message.to_lowercase(),
+        log.raw.to_lowercase(),
+        log.exception
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase(),
+        log.stack_trace
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase(),
+    ];
+
+    terms.iter()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .all(|term| fields.iter().any(|field| field.contains(&term)))
+}
+
+fn filter_logs_by_text_terms(logs: Vec<LogEntry>, terms: &[&str]) -> Vec<LogEntry> {
+    if terms.iter().all(|term| term.trim().is_empty()) {
+        return logs;
+    }
+
+    logs.into_iter()
+        .filter(|log| log_matches_text_terms(log, terms))
+        .collect()
+}
+
 /// 启动完整诊断流程（实时模式）
 #[tauri::command]
 pub async fn start_diagnosis(
@@ -1091,13 +1121,22 @@ pub async fn start_historical_diagnosis(
     let logs = if !trace_id_keys.is_empty() {
         // traceId 直查：用 terms 精确匹配，不受 Lucene 点号解析影响
         let tids: Vec<String> = trace_id_keys.iter().map(|s| s.to_string()).collect();
+        let query_detail = if text_keys.is_empty() {
+            format!("traceId 精确查询：{}", tids.join(", "))
+        } else {
+            format!(
+                "traceId 精确查询并过滤关键词：{}；关键词：{}",
+                tids.join(", "),
+                text_keys.join(" ")
+            )
+        };
         emit_step(
             &app,
             "elk-query",
-            &format!("traceId 精确查询：{}", tids.join(", ")),
+            &query_detail,
             "running",
         );
-        elk_collector
+        let trace_logs = elk_collector
             .query_by_exact_trace_ids(&tids, &window)
             .await
             .map_err(|e| {
@@ -1108,7 +1147,13 @@ pub async fn start_historical_diagnosis(
                     "error",
                 );
                 format!("ELK 查询失败: {}", e)
-            })?
+            })?;
+
+        if text_keys.is_empty() {
+            trace_logs
+        } else {
+            filter_logs_by_text_terms(trace_logs, &text_keys)
+        }
     } else {
         // 普通关键词全文搜索
         let text_keywords: Vec<String> = text_keys.iter().map(|s| s.to_string()).collect();
@@ -2087,5 +2132,56 @@ mod tests {
         config.ssh.password = None;
         config.ssh.private_key = Some("/Users/test/.ssh/id_rsa".into());
         assert!(has_ssh_fallback_config(&config));
+    }
+
+    #[test]
+    fn test_filter_logs_by_text_terms_keeps_trace_logs_matching_all_terms() {
+        let logs = vec![
+            LogEntry {
+                time: Some("2026-06-23T10:00:00+08:00".into()),
+                level: "ERROR".into(),
+                service: "svc-a".into(),
+                trace_id: Some("abcd.1234".into()),
+                thread: None,
+                class: None,
+                method: None,
+                message: "Timeout while calling PCM".into(),
+                exception: Some("Database ERROR".into()),
+                stack_trace: Some("java.lang.RuntimeException: timeout".into()),
+                raw: "{\"message\":\"timeout\",\"detail\":\"db error\"}".into(),
+            },
+            LogEntry {
+                time: Some("2026-06-23T10:01:00+08:00".into()),
+                level: "ERROR".into(),
+                service: "svc-a".into(),
+                trace_id: Some("abcd.1234".into()),
+                thread: None,
+                class: None,
+                method: None,
+                message: "Timeout while calling PCM".into(),
+                exception: None,
+                stack_trace: None,
+                raw: "{\"message\":\"timeout only\"}".into(),
+            },
+            LogEntry {
+                time: Some("2026-06-23T10:02:00+08:00".into()),
+                level: "WARN".into(),
+                service: "svc-b".into(),
+                trace_id: Some("efgh.5678".into()),
+                thread: None,
+                class: None,
+                method: None,
+                message: "Database issue only".into(),
+                exception: None,
+                stack_trace: None,
+                raw: "{\"message\":\"db error\"}".into(),
+            },
+        ];
+
+        let filtered = filter_logs_by_text_terms(logs, &["timeout", "error"]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].trace_id.as_deref(), Some("abcd.1234"));
+        assert_eq!(filtered[0].service, "svc-a");
     }
 }

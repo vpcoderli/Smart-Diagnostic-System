@@ -16,6 +16,14 @@ pub struct DiagnosisRunner {
     historical_window: Option<TimeWindow>,
 }
 
+fn has_database_config(config: &diag_core::config::DatabaseConfig) -> bool {
+    !config.db_type.trim().is_empty()
+        && !config.host.trim().is_empty()
+        && config.port > 0
+        && !config.database.trim().is_empty()
+        && !config.username.trim().is_empty()
+}
+
 impl DiagnosisRunner {
     /// 实时模式：从浏览器捕获的页面数据出发
     pub fn new(
@@ -123,23 +131,35 @@ impl DiagnosisRunner {
         let sql_traces = crate::sql_extractor::extract_sql_traces(&all_logs);
         tracing::info!("SQL trace 提取完成，共 {} 条", sql_traces.len());
 
-        // Step 4: 查询慢 SQL + 表统计
-        let (slow_sqls, mut table_stats) =
-            self.collect_db_data_tracked(&mut collection_errors).await;
-        self.collect_sql_trace_table_stats(&sql_traces, &mut table_stats, &mut collection_errors)
+        let (slow_sqls, table_stats, explain_plans) = if has_database_config(&self.config.database) {
+            // Step 4: 查询慢 SQL + 表统计
+            let (slow_sqls, mut table_stats) =
+                self.collect_db_data_tracked(&mut collection_errors).await;
+            self.collect_sql_trace_table_stats(
+                &sql_traces,
+                &mut table_stats,
+                &mut collection_errors,
+            )
             .await;
 
-        // Step 4b: 收集 EXPLAIN 计划
-        //   - 来自 db_collector 的慢 SQL（已是规范化文本，可直接 EXPLAIN）
-        //   - 来自日志的 SQL trace（需先用 Parameters 行回填占位符再 EXPLAIN）
-        let explain_collector =
-            crate::explain_collector::ExplainCollector::new(self.config.database.clone(), 500.0);
-        let mut explain_plans = explain_collector.collect_explain_plans(&slow_sqls).await;
-        let log_sql_plans = explain_collector
-            .collect_explain_for_sql_traces(&sql_traces)
-            .await;
-        explain_plans.extend(log_sql_plans);
-        tracing::info!("EXPLAIN 计划收集完成，共 {} 条", explain_plans.len());
+            // Step 4b: 收集 EXPLAIN 计划
+            //   - 来自 db_collector 的慢 SQL（已是规范化文本，可直接 EXPLAIN）
+            //   - 来自日志的 SQL trace（需先用 Parameters 行回填占位符再 EXPLAIN）
+            let explain_collector = crate::explain_collector::ExplainCollector::new(
+                self.config.database.clone(),
+                500.0,
+            );
+            let mut explain_plans = explain_collector.collect_explain_plans(&slow_sqls).await;
+            let log_sql_plans = explain_collector
+                .collect_explain_for_sql_traces(&sql_traces)
+                .await;
+            explain_plans.extend(log_sql_plans);
+            tracing::info!("EXPLAIN 计划收集完成，共 {} 条", explain_plans.len());
+            (slow_sqls, table_stats, explain_plans)
+        } else {
+            tracing::info!("未配置可用数据库，跳过数据库采集、表统计和 EXPLAIN");
+            (Vec::new(), Vec::new(), Vec::new())
+        };
 
         // 统计跳过的服务（仅实时模式有请求，历史模式无需此步）
         let grouped = self.group_requests_by_service();
@@ -999,6 +1019,24 @@ mod tests {
         );
         assert!(manifest.keywords.is_none());
         assert!(manifest.time_range.is_some());
+    }
+
+    #[test]
+    fn test_has_database_config_rejects_empty_placeholder() {
+        let valid = test_config().database;
+        assert!(has_database_config(&valid));
+
+        let placeholder = DatabaseConfig {
+            db_type: "".into(),
+            host: "".into(),
+            port: 0,
+            username: "".into(),
+            password: "".into(),
+            database: "".into(),
+            schemas: Vec::new(),
+        };
+
+        assert!(!has_database_config(&placeholder));
     }
 
     #[test]
