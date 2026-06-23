@@ -52,6 +52,115 @@ pub fn detect_operation(sql: &str) -> &'static str {
     }
 }
 
+/// 解析 MyBatis Parameters 行字符串为 (值, 类型) 列表
+/// 输入示例: "218713736305705076(String), 1(Integer), null"
+fn parse_mybatis_parameters(params_str: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0;
+    let mut in_quote = false;
+
+    for ch in params_str.chars() {
+        match ch {
+            '(' if !in_quote => { depth += 1; buf.push(ch); }
+            ')' if !in_quote => { depth -= 1; buf.push(ch); }
+            '\'' => { in_quote = !in_quote; buf.push(ch); }
+            ',' if depth == 0 && !in_quote => {
+                push_parameter(&mut result, buf.trim());
+                buf.clear();
+            }
+            _ => buf.push(ch),
+        }
+    }
+    if !buf.trim().is_empty() {
+        push_parameter(&mut result, buf.trim());
+    }
+    result
+}
+
+fn push_parameter(result: &mut Vec<(String, String)>, raw: &str) {
+    let raw = raw.trim();
+    if raw.is_empty() { return; }
+    if raw.eq_ignore_ascii_case("null") {
+        result.push(("null".to_string(), "null".to_string()));
+        return;
+    }
+    if let Some(open) = raw.rfind('(') {
+        if raw.ends_with(')') {
+            let value = raw[..open].trim().to_string();
+            let type_name = raw[open + 1..raw.len() - 1].trim().to_string();
+            result.push((value, type_name));
+            return;
+        }
+    }
+    result.push((raw.to_string(), String::new()));
+}
+
+fn needs_quote(type_name: &str) -> bool {
+    let t = type_name.to_ascii_lowercase();
+    !matches!(
+        t.as_str(),
+        "integer" | "int" | "long" | "short" | "byte"
+        | "float" | "double" | "decimal" | "bigdecimal" | "biginteger"
+        | "boolean" | "bool" | "null"
+    )
+}
+
+fn escape_sql_value(v: &str) -> String {
+    v.replace('\'', "''")
+}
+
+/// 将 SQL 中的 `?` 占位符按 MyBatis Parameters 行的值顺序替换。
+/// 字符串/日期等类型加单引号，数值不加，null 替换为 NULL；字符串字面量内的 `?` 不替换。
+pub fn substitute_mybatis_parameters(sql: &str, params_str: &str) -> String {
+    let params = parse_mybatis_parameters(params_str);
+    if params.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut idx = 0;
+    let mut in_quote = false;
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' {
+            if in_quote && i + 1 < chars.len() && chars[i + 1] == '\'' {
+                out.push('\'');
+                out.push('\'');
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '?' && !in_quote {
+            if let Some((value, type_name)) = params.get(idx) {
+                if value.eq_ignore_ascii_case("null") {
+                    out.push_str("NULL");
+                } else if needs_quote(type_name) {
+                    out.push('\'');
+                    out.push_str(&escape_sql_value(value));
+                    out.push('\'');
+                } else {
+                    out.push_str(value);
+                }
+                idx += 1;
+            } else {
+                out.push('?');
+            }
+            i += 1;
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
 /// MySQL 慢查询日志解析
 pub fn parse_mysql_slow_log_entry(block: &str) -> Option<(String, f64, i64, i64)> {
     let mut query_time: Option<f64> = None;
@@ -113,5 +222,67 @@ mod tests {
         assert_eq!(detect_operation("  update t set a=1"), "UPDATE");
         assert_eq!(detect_operation("INSERT INTO t VALUES (1)"), "INSERT");
         assert_eq!(detect_operation("DELETE FROM t WHERE id=1"), "DELETE");
+    }
+
+    #[test]
+    fn test_substitute_string_param() {
+        let sql = "select id from t where uid = ?";
+        let out = substitute_mybatis_parameters(sql, "218713736305705076(String)");
+        assert_eq!(out, "select id from t where uid = '218713736305705076'");
+    }
+
+    #[test]
+    fn test_substitute_integer_param_no_quote() {
+        let sql = "select id from t where age = ?";
+        let out = substitute_mybatis_parameters(sql, "18(Integer)");
+        assert_eq!(out, "select id from t where age = 18");
+    }
+
+    #[test]
+    fn test_substitute_multiple_params() {
+        let sql = "select id from t where uid = ? and status = ? and price > ?";
+        let out = substitute_mybatis_parameters(
+            sql, "218713736305705076(String), 1(Integer), 99.5(BigDecimal)"
+        );
+        assert_eq!(
+            out,
+            "select id from t where uid = '218713736305705076' and status = 1 and price > 99.5"
+        );
+    }
+
+    #[test]
+    fn test_substitute_null_param() {
+        let sql = "update t set b = ? where id = ?";
+        let out = substitute_mybatis_parameters(sql, "null, 1(Long)");
+        assert_eq!(out, "update t set b = NULL where id = 1");
+    }
+
+    #[test]
+    fn test_substitute_quote_escape() {
+        let sql = "select * from t where name = ?";
+        let out = substitute_mybatis_parameters(sql, "O'Brien(String)");
+        assert_eq!(out, "select * from t where name = 'O''Brien'");
+    }
+
+    #[test]
+    fn test_substitute_skips_questionmark_in_string_literal() {
+        let sql = "select '?' as x where id = ?";
+        let out = substitute_mybatis_parameters(sql, "1(Integer)");
+        assert_eq!(out, "select '?' as x where id = 1");
+    }
+
+    #[test]
+    fn test_substitute_no_params_returns_original() {
+        let sql = "select * from t where id = ?";
+        let out = substitute_mybatis_parameters(sql, "");
+        assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn test_substitute_real_world_example() {
+        let sql = "select id, user_id, permission_no, permission_type_value, data_id, org_id, org_hos_id, org_node_type, create_user_id, create_time, update_user_id, update_time from tb_user_permission where user_id = ? order by id";
+        let out = substitute_mybatis_parameters(sql, "218713736305705076(String)");
+        assert!(out.contains("user_id = '218713736305705076'"));
+        assert!(!out.contains('?'));
     }
 }

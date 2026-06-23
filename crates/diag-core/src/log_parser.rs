@@ -2,6 +2,7 @@ use crate::models::LogEntry;
 use regex::Regex;
 use std::sync::LazyLock;
 
+#[allow(dead_code)]
 static JSON_LOG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\{.*"traceId".*\}"#).unwrap()
 });

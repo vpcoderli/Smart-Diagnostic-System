@@ -5,3 +5,4 @@ pub mod sql_parser;
 pub mod masking;
 pub mod package;
 pub mod config;
+pub mod collector_trait;

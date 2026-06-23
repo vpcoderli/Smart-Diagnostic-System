@@ -1,6 +1,113 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// 收集端配置
+// ─── ELK 字段映射 ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldMapping {
+    pub timestamp: String,
+    pub level: String,
+    pub service: String,
+    pub trace_id: String,
+    pub message: String,
+    pub exception: String,
+    pub stack_trace: String,
+    pub thread: String,
+}
+
+impl Default for FieldMapping {
+    fn default() -> Self {
+        Self {
+            timestamp: "@timestamp".into(),
+            level: "level".into(),
+            service: "serviceName".into(),
+            trace_id: "traceId".into(),
+            message: "message".into(),
+            exception: "exception".into(),
+            stack_trace: "stackTrace".into(),
+            thread: "thread".into(),
+        }
+    }
+}
+
+// ─── ELK 配置 ───
+
+fn default_timeout() -> u64 { 30 }
+fn default_max_hits() -> usize { 1000 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElkConfig {
+    pub address: String,
+    pub index_pattern: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_max_hits")]
+    pub max_hits_per_trace: usize,
+    #[serde(default)]
+    pub field_mapping: FieldMapping,
+}
+
+impl Default for ElkConfig {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            index_pattern: "logstash-*".into(),
+            username: None,
+            password: None,
+            timeout_secs: 30,
+            max_hits_per_trace: 1000,
+            field_mapping: FieldMapping::default(),
+        }
+    }
+}
+
+// ─── Nacos 配置 ───
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NacosConfig {
+    pub address: String,
+    pub namespace: String,
+    pub group: String,
+    pub service_prefix: String,
+    pub log_path_pattern: String,
+}
+
+// ─── 定时巡检配置 ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleConfig {
+    pub enabled: bool,
+    pub interval_minutes: u32,
+    pub lookback_minutes: u32,
+    pub overlap_minutes: u32,
+    pub levels: Vec<String>,
+    pub extra_keywords: Vec<String>,
+    pub service_filter: Option<Vec<String>>,
+    pub max_trace_ids_per_run: usize,
+    pub dedup_window_minutes: u32,
+    pub output_retention_days: u32,
+}
+
+impl Default for ScheduleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: 5,
+            lookback_minutes: 6,
+            overlap_minutes: 1,
+            levels: vec!["ERROR".into(), "WARN".into()],
+            extra_keywords: vec![],
+            service_filter: None,
+            max_trace_ids_per_run: 50,
+            dedup_window_minutes: 60,
+            output_retention_days: 7,
+        }
+    }
+}
+
+// ─── 收集端配置 ───
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectorConfig {
     pub site: SiteConfig,
@@ -10,6 +117,12 @@ pub struct CollectorConfig {
     pub database: DatabaseConfig,
     pub privacy: PrivacyConfig,
     pub collector: CollectorSettings,
+    #[serde(default)]
+    pub elk: Option<ElkConfig>,
+    #[serde(default)]
+    pub nacos: Option<NacosConfig>,
+    #[serde(default)]
+    pub schedule: Option<ScheduleConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +163,10 @@ pub struct DatabaseConfig {
     pub username: String,
     pub password: String,
     pub database: String,
+    /// PostgreSQL 模式（schema）列表。MySQL 留空。
+    /// 按顺序 SET search_path，PG 会按顺序查找表（首个匹配生效）。
+    #[serde(default)]
+    pub schemas: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
