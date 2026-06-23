@@ -531,6 +531,7 @@ fn test_realtime_package_masks_request_urls_in_markdown_and_structured_json() {
     let zip_path = dir.path().join("realtime-masked-url-test.zip");
     let (mut pkg, _) = mock_diagnosis_package();
     pkg.captured_page.requests[0].url = "http://10.0.0.1/gateway/pcm-management/v1/patient/list?pageNum=1&pageSize=20&patientName=张三&phone=13800000000".into();
+    pkg.captured_page.page_url = "http://10.0.0.1/pcm-manage/patient-list?patientName=李四&phone=13900000000&pageNum=1".into();
 
     build_realtime_package(
         &pkg.logs,
@@ -552,6 +553,8 @@ fn test_realtime_package_masks_request_urls_in_markdown_and_structured_json() {
         .unwrap()
         .read_to_string(&mut overview)
         .unwrap();
+    assert!(!overview.contains("李四"));
+    assert!(!overview.contains("13900000000"));
     assert!(!overview.contains("张三"));
     assert!(!overview.contains("13800000000"));
 
@@ -563,6 +566,8 @@ fn test_realtime_package_masks_request_urls_in_markdown_and_structured_json() {
         .unwrap();
     assert!(request_logs.contains("pageNum=1"));
     assert!(request_logs.contains("pageSize=20"));
+    assert!(!request_logs.contains("李四"));
+    assert!(!request_logs.contains("13900000000"));
     assert!(!request_logs.contains("张三"));
     assert!(!request_logs.contains("13800000000"));
 
@@ -573,6 +578,9 @@ fn test_realtime_package_masks_request_urls_in_markdown_and_structured_json() {
     assert!(stored_url.contains("pageSize=20"));
     assert!(!stored_url.contains("张三"));
     assert!(!stored_url.contains("13800000000"));
+    assert!(!loaded.manifest.page_url.contains("李四"));
+    assert!(!loaded.manifest.page_url.contains("13900000000"));
+    assert!(loaded.manifest.page_url.contains("pageNum=1"));
 }
 
 #[test]

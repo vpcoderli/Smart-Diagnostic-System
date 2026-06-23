@@ -174,6 +174,7 @@ fn default_report_privacy_config() -> PrivacyConfig {
 fn masked_captured_page(captured_page: &CapturedPage) -> CapturedPage {
     let privacy = default_report_privacy_config();
     let mut masked_page = captured_page.clone();
+    masked_page.page_url = masking::mask_url(&captured_page.page_url, &privacy);
     for request in &mut masked_page.requests {
         request.url = mask_captured_request_url(&request.url, &captured_page.page_url, &privacy);
     }
