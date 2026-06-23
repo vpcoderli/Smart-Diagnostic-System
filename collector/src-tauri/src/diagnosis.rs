@@ -37,6 +37,21 @@ impl DiagnosisRunner {
         config: CollectorConfig,
         log_collector: Box<dyn LogCollector>,
         trace_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            config,
+            captured: None,
+            log_collector,
+            trace_ids,
+            historical_window: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_historical_with_window(
+        config: CollectorConfig,
+        log_collector: Box<dyn LogCollector>,
+        trace_ids: Vec<String>,
         window: TimeWindow,
     ) -> Self {
         Self {
@@ -728,7 +743,7 @@ mod tests {
     #[test]
     fn diagnosis_manifest_historical_uses_historical_defaults() {
         let config = test_config();
-        let runner = DiagnosisRunner::new_historical(
+        let runner = DiagnosisRunner::new_historical_with_window(
             config.clone(),
             Box::new(StubLogCollector),
             vec!["trace-2".into(), "trace-1".into()],
