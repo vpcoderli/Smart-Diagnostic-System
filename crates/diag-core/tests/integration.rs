@@ -6,7 +6,10 @@ use diag_core::config::{
     NacosConfig, PrivacyConfig, ScheduleConfig, ServiceConfig, SiteConfig, SshConfig,
 };
 use diag_core::models::*;
-use diag_core::package::{build_package, build_realtime_package, read_package};
+use diag_core::package::{
+    build_package, build_quick_package_with_manifest, build_realtime_package,
+    build_realtime_package_with_manifest, read_package,
+};
 use tempfile::tempdir;
 
 // ─── Mock 数据工厂 ───
@@ -516,7 +519,10 @@ fn test_realtime_package_can_be_read_as_structured_package() {
 
     let loaded = read_package(&zip_path).expect("realtime package should be importable");
     assert_eq!(loaded.manifest.collection_mode.as_deref(), Some("realtime"));
-    assert_eq!(loaded.captured_page.requests.len(), pkg.captured_page.requests.len());
+    assert_eq!(
+        loaded.captured_page.requests.len(),
+        pkg.captured_page.requests.len()
+    );
     assert_eq!(loaded.logs.len(), pkg.logs.len());
     assert_eq!(loaded.sql_traces.len(), pkg.sql_traces.len());
     assert_eq!(loaded.explain_plans.len(), pkg.explain_plans.len());
@@ -531,7 +537,9 @@ fn test_realtime_package_masks_request_urls_in_markdown_and_structured_json() {
     let zip_path = dir.path().join("realtime-masked-url-test.zip");
     let (mut pkg, _) = mock_diagnosis_package();
     pkg.captured_page.requests[0].url = "http://10.0.0.1/gateway/pcm-management/v1/patient/list?pageNum=1&pageSize=20&patientName=张三&phone=13800000000".into();
-    pkg.captured_page.page_url = "http://10.0.0.1/pcm-manage/patient-list?patientName=李四&phone=13900000000&pageNum=1".into();
+    pkg.captured_page.page_url =
+        "http://10.0.0.1/pcm-manage/patient-list?patientName=李四&phone=13900000000&pageNum=1"
+            .into();
 
     build_realtime_package(
         &pkg.logs,
@@ -612,6 +620,128 @@ fn test_realtime_package_masks_relative_request_urls() {
 }
 
 #[test]
+fn test_realtime_package_with_manifest_preserves_metadata_and_collection_report() {
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("realtime-manifest-report-test.zip");
+    let (mut pkg, _) = mock_diagnosis_package();
+    pkg.manifest.diagnosis_id = "diag-real-001".into();
+    pkg.manifest.site = "real-hospital".into();
+    pkg.manifest.system = "pcm-real".into();
+    pkg.manifest.database_type = "postgresql".into();
+    pkg.manifest.collector_version = "collector-9.9.9".into();
+    pkg.manifest.collection_mode = Some("realtime".into());
+    pkg.manifest.log_source = Some("elk".into());
+    pkg.manifest.gateway_prefix = Some("/custom-gateway".into());
+    pkg.manifest.page_url = "http://10.0.0.1/pcm?pageNum=1&patientName=王五".into();
+    pkg.captured_page.page_url = pkg.manifest.page_url.clone();
+    let report = CollectionReport {
+        collected_at: "2026-06-23T11:30:00+08:00".into(),
+        log_source: "elk".into(),
+        log_count: 3,
+        sql_trace_count: 1,
+        explain_plan_count: 0,
+        skipped_services: vec!["unknown（URL 无法解析服务名）".into()],
+        errors: vec!["DB 采集失败: timeout".into()],
+    };
+
+    build_realtime_package_with_manifest(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/custom-gateway",
+        &pkg.manifest,
+        Some(&report),
+        &zip_path,
+    )
+    .unwrap();
+
+    let loaded = read_package(&zip_path).unwrap();
+    assert_eq!(loaded.manifest.diagnosis_id, "diag-real-001");
+    assert_eq!(loaded.manifest.site, "real-hospital");
+    assert_eq!(loaded.manifest.system, "pcm-real");
+    assert_eq!(loaded.manifest.database_type, "postgresql");
+    assert_eq!(loaded.manifest.collector_version, "collector-9.9.9");
+    assert_eq!(loaded.manifest.collection_mode.as_deref(), Some("realtime"));
+    assert_eq!(loaded.manifest.log_source.as_deref(), Some("elk"));
+    assert_eq!(
+        loaded.manifest.gateway_prefix.as_deref(),
+        Some("/custom-gateway")
+    );
+    assert!(loaded.manifest.page_url.contains("pageNum=1"));
+    assert!(!loaded.manifest.page_url.contains("王五"));
+
+    let loaded_report = loaded
+        .collection_report
+        .expect("collection report should be preserved");
+    assert_eq!(loaded_report.log_source, "elk");
+    assert_eq!(
+        loaded_report.errors,
+        vec!["DB 采集失败: timeout".to_string()]
+    );
+    assert_eq!(
+        loaded_report.skipped_services,
+        vec!["unknown（URL 无法解析服务名）".to_string()]
+    );
+}
+
+#[test]
+fn test_quick_package_with_manifest_preserves_historical_mode_and_report() {
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("quick-manifest-report-test.zip");
+    let (mut pkg, _) = mock_diagnosis_package();
+    pkg.manifest.diagnosis_id = "diag-historical-001".into();
+    pkg.manifest.site = "history-hospital".into();
+    pkg.manifest.system = "pcm-history".into();
+    pkg.manifest.database_type = "mysql".into();
+    pkg.manifest.collector_version = "collector-1.2.3".into();
+    pkg.manifest.collection_mode = Some("historical".into());
+    pkg.manifest.log_source = Some("ssh".into());
+    pkg.manifest.page_url = "historical".into();
+    pkg.manifest.request_count = 0;
+    let report = CollectionReport {
+        collected_at: "2026-06-23T11:40:00+08:00".into(),
+        log_source: "ssh".into(),
+        log_count: 3,
+        sql_trace_count: 1,
+        explain_plan_count: 0,
+        skipped_services: vec![],
+        errors: vec!["SSH 日志采集失败: auth failed".into()],
+    };
+
+    build_quick_package_with_manifest(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.manifest,
+        Some(&report),
+        &zip_path,
+    )
+    .unwrap();
+
+    let loaded = read_package(&zip_path).unwrap();
+    assert_eq!(loaded.manifest.diagnosis_id, "diag-historical-001");
+    assert_eq!(loaded.manifest.site, "history-hospital");
+    assert_eq!(loaded.manifest.system, "pcm-history");
+    assert_eq!(
+        loaded.manifest.collection_mode.as_deref(),
+        Some("historical")
+    );
+    assert_eq!(loaded.manifest.log_source.as_deref(), Some("ssh"));
+    assert_eq!(loaded.manifest.request_count, 0);
+    assert_eq!(loaded.captured_page.page_url, "historical");
+    let loaded_report = loaded
+        .collection_report
+        .expect("collection report should be preserved");
+    assert_eq!(
+        loaded_report.errors,
+        vec!["SSH 日志采集失败: auth failed".to_string()]
+    );
+}
+
+#[test]
 fn test_realtime_package_outputs_overview_index() {
     use std::io::Read;
 
@@ -640,7 +770,9 @@ fn test_realtime_package_outputs_overview_index() {
         .unwrap();
 
     assert!(overview.contains("# 实时诊断报告"));
-    assert!(overview.contains("| # | 风险 | traceId | 接口 | 状态码 | 耗时 | 服务 | 日志信号 | SQL | EXPLAIN |"));
+    assert!(overview.contains(
+        "| # | 风险 | traceId | 接口 | 状态码 | 耗时 | 服务 | 日志信号 | SQL | EXPLAIN |"
+    ));
     assert!(overview.contains("| 1 | ERROR | `trace-abc123` | /v1/patient/list | 200 | 3500ms | pcm-management | ERROR=1 WARN=0 | 1 | 0 成功 / 0 失败 |"));
     assert!(overview.contains("| 2 | OK | `trace-def456` | /v1/user/info | 200 | 150ms | pcm-user | ERROR=0 WARN=0 | 0 | 0 成功 / 0 失败 |"));
     assert!(overview.contains("| 3 | ERROR | `无 traceId` | /v1/patient/update | 500 | 200ms | pcm-management | ERROR=0 WARN=0 | 0 | 0 成功 / 0 失败 |"));

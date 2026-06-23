@@ -1,8 +1,8 @@
 use crate::config::PrivacyConfig;
 use crate::masking;
 use crate::models::{
-    CapturedPage, CapturedRequest, DiagnosisManifest, DiagnosisPackage, ExplainPlan, LogEntry,
-    MaskingReport, SqlTrace, TableStats,
+    CapturedPage, CapturedRequest, CollectionReport, DiagnosisManifest, DiagnosisPackage,
+    ExplainPlan, LogEntry, MaskingReport, SqlTrace, TableStats,
 };
 use crate::url_resolver;
 use anyhow::Result;
@@ -31,6 +31,7 @@ pub fn build_package(
         &package.sql_traces,
         &package.explain_plans,
         &package.table_stats,
+        package.collection_report.as_ref(),
     )?;
 
     if !package.slow_sqls.is_empty() {
@@ -41,12 +42,6 @@ pub fn build_package(
     // privacy/masking-report.json
     zip.start_file("privacy/masking-report.json", options)?;
     zip.write_all(serde_json::to_string_pretty(masking_report)?.as_bytes())?;
-
-    // collection_report/report.json
-    if let Some(ref report) = package.collection_report {
-        zip.start_file("collection_report/report.json", options)?;
-        zip.write_all(serde_json::to_string_pretty(report)?.as_bytes())?;
-    }
 
     zip.finish()?;
     Ok(())
@@ -61,6 +56,7 @@ fn write_structured_contents<W: Write + std::io::Seek>(
     sql_traces: &[SqlTrace],
     explain_plans: &[ExplainPlan],
     table_stats: &[TableStats],
+    collection_report: Option<&CollectionReport>,
 ) -> Result<()> {
     zip.start_file("manifest.json", options)?;
     zip.write_all(serde_json::to_string_pretty(manifest)?.as_bytes())?;
@@ -74,7 +70,10 @@ fn write_structured_contents<W: Write + std::io::Seek>(
 
     let mut logs_by_service: HashMap<&str, Vec<&LogEntry>> = HashMap::new();
     for log in logs {
-        logs_by_service.entry(log.service.as_str()).or_default().push(log);
+        logs_by_service
+            .entry(log.service.as_str())
+            .or_default()
+            .push(log);
     }
     for (service, entries) in &logs_by_service {
         let file_path = format!("services/{}/app-log.jsonl", service);
@@ -98,6 +97,21 @@ fn write_structured_contents<W: Write + std::io::Seek>(
     if !table_stats.is_empty() {
         zip.start_file("database/table-stats.json", options)?;
         zip.write_all(serde_json::to_string_pretty(table_stats)?.as_bytes())?;
+    }
+
+    write_collection_report(zip, options, collection_report)?;
+
+    Ok(())
+}
+
+fn write_collection_report<W: Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    options: zip::write::SimpleFileOptions,
+    collection_report: Option<&CollectionReport>,
+) -> Result<()> {
+    if let Some(report) = collection_report {
+        zip.start_file("collection_report/report.json", options)?;
+        zip.write_all(serde_json::to_string_pretty(report)?.as_bytes())?;
     }
 
     Ok(())
@@ -312,14 +326,6 @@ pub fn build_quick_package(
     table_stats: &[TableStats],
     output_path: &Path,
 ) -> Result<()> {
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let file = std::fs::File::create(output_path)?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
     let captured_page = CapturedPage {
         page_url: "quick".into(),
         requests: Vec::new(),
@@ -332,16 +338,81 @@ pub fn build_quick_package(
         "quick-package",
         None,
     );
+    build_quick_package_with_manifest(
+        logs,
+        sql_traces,
+        explain_plans,
+        table_stats,
+        &manifest,
+        None,
+        output_path,
+    )
+}
+
+/// 实时诊断模式：在快速诊断包内容基础上，额外输出按浏览器请求 traceId 分组的日志。
+pub fn build_realtime_package(
+    logs: &[LogEntry],
+    sql_traces: &[SqlTrace],
+    explain_plans: &[ExplainPlan],
+    table_stats: &[TableStats],
+    captured_page: &CapturedPage,
+    gateway_prefix: &str,
+    output_path: &Path,
+) -> Result<()> {
+    let masked_page = masked_captured_page(captured_page);
+    let manifest = synthetic_manifest(
+        &masked_page,
+        logs,
+        sql_traces,
+        "realtime",
+        "realtime-package",
+        Some(gateway_prefix),
+    );
+    build_realtime_package_with_manifest(
+        logs,
+        sql_traces,
+        explain_plans,
+        table_stats,
+        captured_page,
+        gateway_prefix,
+        &manifest,
+        None,
+        output_path,
+    )
+}
+
+pub fn build_quick_package_with_manifest(
+    logs: &[LogEntry],
+    sql_traces: &[SqlTrace],
+    explain_plans: &[ExplainPlan],
+    table_stats: &[TableStats],
+    manifest: &DiagnosisManifest,
+    collection_report: Option<&CollectionReport>,
+    output_path: &Path,
+) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = std::fs::File::create(output_path)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let captured_page = CapturedPage {
+        page_url: manifest.page_url.clone(),
+        requests: Vec::new(),
+    };
 
     write_structured_contents(
         &mut zip,
         options,
-        &manifest,
+        manifest,
         &captured_page,
         logs,
         sql_traces,
         explain_plans,
         table_stats,
+        collection_report,
     )?;
 
     write_quick_contents(
@@ -357,14 +428,15 @@ pub fn build_quick_package(
     Ok(())
 }
 
-/// 实时诊断模式：在快速诊断包内容基础上，额外输出按浏览器请求 traceId 分组的日志。
-pub fn build_realtime_package(
+pub fn build_realtime_package_with_manifest(
     logs: &[LogEntry],
     sql_traces: &[SqlTrace],
     explain_plans: &[ExplainPlan],
     table_stats: &[TableStats],
     captured_page: &CapturedPage,
     gateway_prefix: &str,
+    manifest: &DiagnosisManifest,
+    collection_report: Option<&CollectionReport>,
     output_path: &Path,
 ) -> Result<()> {
     if let Some(parent) = output_path.parent() {
@@ -376,14 +448,10 @@ pub fn build_realtime_package(
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     let masked_page = masked_captured_page(captured_page);
-    let manifest = synthetic_manifest(
-        &masked_page,
-        logs,
-        sql_traces,
-        "realtime",
-        "realtime-package",
-        Some(gateway_prefix),
-    );
+    let mut manifest = manifest.clone();
+    manifest.page_url = masked_page.page_url.clone();
+    manifest.request_count = masked_page.requests.len();
+    manifest.gateway_prefix = Some(gateway_prefix.to_string());
 
     write_structured_contents(
         &mut zip,
@@ -394,6 +462,7 @@ pub fn build_realtime_package(
         sql_traces,
         explain_plans,
         table_stats,
+        collection_report,
     )?;
 
     write_quick_contents(
@@ -435,8 +504,12 @@ fn render_realtime_overview_md(
     md.push_str("# 实时诊断报告\n\n");
     md.push_str(&format!("页面 URL：{}\n\n", captured_page.page_url));
     md.push_str("## 一、问题总览\n\n");
-    md.push_str("| # | 风险 | traceId | 接口 | 状态码 | 耗时 | 服务 | 日志信号 | SQL | EXPLAIN |\n");
-    md.push_str("|---|------|---------|------|--------|------|------|----------|-----|---------|\n");
+    md.push_str(
+        "| # | 风险 | traceId | 接口 | 状态码 | 耗时 | 服务 | 日志信号 | SQL | EXPLAIN |\n",
+    );
+    md.push_str(
+        "|---|------|---------|------|--------|------|------|----------|-----|---------|\n",
+    );
 
     for (idx, req) in captured_page.requests.iter().enumerate() {
         let trace_id = req.trace_id.as_deref().filter(|id| !id.is_empty());
@@ -525,8 +598,12 @@ fn classify_request_risk(
     sql_traces: &[&SqlTrace],
     plans: &[&ExplainPlan],
 ) -> &'static str {
-    let has_error_log = logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("ERROR"));
-    let has_warn_log = logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("WARN"));
+    let has_error_log = logs
+        .iter()
+        .any(|entry| entry.level.eq_ignore_ascii_case("ERROR"));
+    let has_warn_log = logs
+        .iter()
+        .any(|entry| entry.level.eq_ignore_ascii_case("WARN"));
     let has_slow_sql = sql_traces
         .iter()
         .any(|trace| trace.duration_ms.map(|d| d > 1000.0).unwrap_or(false));
