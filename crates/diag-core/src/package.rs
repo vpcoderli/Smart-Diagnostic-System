@@ -327,7 +327,10 @@ pub fn read_package(zip_path: &Path) -> Result<DiagnosisPackage> {
 // 快速诊断 TXT 格式打包
 // ═══════════════════════════════════════
 
-/// 快速诊断模式：输出 TXT 格式的 ZIP 包
+/// 快速诊断模式：输出 TXT 格式的 ZIP 包。
+///
+/// 适用于没有慢 SQL 数据的调用方；如果已有慢 SQL、采集报告或更完整的元数据，
+/// 请优先使用 `build_quick_package_with_manifest()` 或其它 richer API。
 pub fn build_quick_package(
     logs: &[LogEntry],
     sql_traces: &[SqlTrace],
