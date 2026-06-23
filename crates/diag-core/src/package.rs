@@ -673,13 +673,14 @@ fn resolve_request(req: &CapturedRequest, gateway_prefix: &str) -> RequestTarget
 }
 
 fn render_request_card_meta(req: &CapturedRequest, target: &RequestTarget) -> String {
-    let end_time = request_end_time(&req.timestamp, req.duration_ms);
+    let start_time = request_start_time(&req.timestamp, req.duration_ms);
+    let end_time = request_end_time(&req.timestamp);
     format!(
         "### 请求信息\n\n| 项目 | 值 |\n|------|-----|\n| Request URL | `{}` |\n| Method / Status | {} / {} |\n| startTime | {} |\n| endTime | {} |\n| duration | {} ms |\n| 入口服务 | {} |\n\n",
         req.url,
         req.method,
         req.status,
-        req.timestamp,
+        start_time,
         end_time,
         req.duration_ms,
         target.service,
@@ -1311,19 +1312,32 @@ fn render_realtime_request_logs_md(captured_page: &CapturedPage, logs: &[LogEntr
 }
 
 fn render_request_meta(req: &CapturedRequest) -> String {
-    let end_time = request_end_time(&req.timestamp, req.duration_ms);
+    let start_time = request_start_time(&req.timestamp, req.duration_ms);
+    let end_time = request_end_time(&req.timestamp);
     format!(
         "Request URL：{}\n\nStatus Code：{}\n\nstartTime：{}\n\nendTime：{}\n\n",
-        req.url, req.status, req.timestamp, end_time
+        req.url, req.status, start_time, end_time
     )
 }
 
-fn request_end_time(start: &str, duration_ms: u64) -> String {
-    DateTime::parse_from_rfc3339(start)
+fn request_start_time(completed_at: &str, duration_ms: u64) -> String {
+    DateTime::parse_from_rfc3339(completed_at)
         .map(|dt: DateTime<FixedOffset>| {
-            (dt + Duration::milliseconds(duration_ms as i64)).to_rfc3339()
+            (dt - Duration::milliseconds(duration_ms.min(i64::MAX as u64) as i64)).to_rfc3339()
         })
         .unwrap_or_else(|_| "-".to_string())
+}
+
+fn request_end_time(completed_at: &str) -> String {
+    DateTime::parse_from_rfc3339(completed_at)
+        .map(|dt: DateTime<FixedOffset>| dt.to_rfc3339())
+        .unwrap_or_else(|_| {
+            if completed_at.is_empty() {
+                "-".to_string()
+            } else {
+                completed_at.to_string()
+            }
+        })
 }
 
 /// 渲染单条 SQL trace 为 Markdown 段落

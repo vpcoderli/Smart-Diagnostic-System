@@ -1192,10 +1192,11 @@ pub async fn start_historical_diagnosis(
 
     // DiagnosisRunner 内部会采集完整链路 + SQL + 打包
     // 在 run() 前先通知前端"采集中"
-    let runner = crate::diagnosis::DiagnosisRunner::new_historical(
+    let runner = crate::diagnosis::DiagnosisRunner::new_historical_with_window(
         config.clone(),
         log_collector,
         trace_ids.clone(),
+        window.clone(),
     );
 
     emit_step(
@@ -1851,7 +1852,9 @@ pub fn open_output_dir(path: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
+    use diag_core::collector_trait::LogCollector;
     use diag_core::config::{
         CollectorSettings, DatabaseConfig, ElkConfig, GatewayConfig, PrivacyConfig, ServiceConfig,
         SiteConfig, SshConfig,
@@ -1902,6 +1905,33 @@ mod tests {
             elk: Some(ElkConfig::default()),
             nacos: None,
             schedule: None,
+        }
+    }
+
+    struct NoopHistoricalCollector;
+
+    #[async_trait]
+    impl LogCollector for NoopHistoricalCollector {
+        async fn query_by_trace_ids(
+            &self,
+            _trace_ids: &[String],
+            _service: Option<&str>,
+            _window: &TimeWindow,
+        ) -> anyhow::Result<Vec<LogEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_by_keywords(
+            &self,
+            _keywords: &[String],
+            _service: Option<&str>,
+            _window: &TimeWindow,
+        ) -> anyhow::Result<Vec<LogEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn source_type(&self) -> &'static str {
+            "elk"
         }
     }
 
@@ -1985,6 +2015,26 @@ mod tests {
                 "svc-b".to_string(),
                 "svc-c".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_historical_runner_constructor_preserves_window() {
+        let window = TimeWindow {
+            start: "2026-06-03T10:00:00+08:00".into(),
+            end: "2026-06-03T11:00:00+08:00".into(),
+        };
+
+        let runner = crate::diagnosis::DiagnosisRunner::new_historical_with_window(
+            mock_collector_config(),
+            Box::new(NoopHistoricalCollector),
+            vec!["trace-1".into()],
+            window.clone(),
+        );
+
+        assert_eq!(
+            runner.historical_window().map(|w| (&w.start, &w.end)),
+            Some((&window.start, &window.end))
         );
     }
 }

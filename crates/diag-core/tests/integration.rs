@@ -1099,6 +1099,39 @@ fn test_realtime_request_cards_use_trace_specific_sql_for_shared_fingerprint() {
 }
 
 #[test]
+fn test_realtime_request_report_treats_timestamp_as_end_time() {
+    use std::io::Read;
+
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("request-time-test.zip");
+    let (mut pkg, _) = mock_diagnosis_package();
+    pkg.captured_page.requests[0].timestamp = "2026-06-03T12:10:00Z".into();
+    pkg.captured_page.requests[0].duration_ms = 420_000;
+
+    build_realtime_package(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/gateway",
+        &zip_path,
+    )
+    .unwrap();
+
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+    let mut cards = String::new();
+    archive
+        .by_name("realtime/request-cards.md")
+        .unwrap()
+        .read_to_string(&mut cards)
+        .unwrap();
+
+    assert!(cards.contains("| startTime | 2026-06-03T12:03:00+00:00 |"));
+    assert!(cards.contains("| endTime | 2026-06-03T12:10:00+00:00 |"));
+}
+
+#[test]
 fn test_read_package_errors_on_malformed_sql_traces_json() {
     let dir = tempdir().unwrap();
     let zip_path = dir.path().join("bad-sql-traces.zip");

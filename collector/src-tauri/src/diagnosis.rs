@@ -47,8 +47,7 @@ impl DiagnosisRunner {
         }
     }
 
-    #[cfg(test)]
-    fn new_historical_with_window(
+    pub fn new_historical_with_window(
         config: CollectorConfig,
         log_collector: Box<dyn LogCollector>,
         trace_ids: Vec<String>,
@@ -61,6 +60,10 @@ impl DiagnosisRunner {
             trace_ids,
             historical_window: Some(window),
         }
+    }
+
+    pub fn historical_window(&self) -> Option<&TimeWindow> {
+        self.historical_window.as_ref()
     }
 
     /// 执行完整诊断流程，返回 diagnosis.zip 路径
@@ -959,11 +962,12 @@ mod tests {
     #[test]
     fn diagnosis_manifest_historical_uses_historical_defaults() {
         let config = test_config();
+        let expected_window = sample_window();
         let runner = DiagnosisRunner::new_historical_with_window(
             config.clone(),
             Box::new(StubLogCollector),
             vec!["trace-2".into(), "trace-1".into()],
-            sample_window(),
+            expected_window.clone(),
         );
         let logs = sample_logs();
         let sql_traces = sample_sql_traces();
@@ -985,6 +989,10 @@ mod tests {
         assert_eq!(manifest.request_count, 0);
         assert_eq!(manifest.log_source.as_deref(), Some("elk"));
         assert_eq!(manifest.database_type, "postgresql");
+        assert_eq!(
+            runner.historical_window().map(|w| (&w.start, &w.end)),
+            Some((&expected_window.start, &expected_window.end))
+        );
         assert_eq!(
             manifest.trace_ids,
             vec!["trace-1".to_string(), "trace-2".to_string()]
