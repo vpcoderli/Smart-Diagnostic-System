@@ -5,6 +5,7 @@ use diag_core::collector_trait::LogCollector;
 use diag_core::config::{ServiceConfig, SshConfig};
 use diag_core::log_parser;
 use diag_core::models::{LogEntry, TimeWindow};
+use std::sync::{Arc, Mutex};
 
 use crate::ssh_collector;
 
@@ -13,6 +14,7 @@ pub struct SshLogCollector {
     ssh_config: SshConfig,
     services: Vec<ServiceConfig>,
     max_log_lines: usize,
+    warnings: Arc<Mutex<Vec<String>>>,
 }
 
 impl SshLogCollector {
@@ -21,11 +23,24 @@ impl SshLogCollector {
             ssh_config,
             services,
             max_log_lines,
+            warnings: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn find_service(&self, name: &str) -> Option<&ServiceConfig> {
         self.services.iter().find(|s| s.name == name)
+    }
+
+    fn clear_warnings(&self) {
+        if let Ok(mut warnings) = self.warnings.lock() {
+            warnings.clear();
+        }
+    }
+
+    fn record_warning(&self, msg: String) {
+        if let Ok(mut warnings) = self.warnings.lock() {
+            warnings.push(msg);
+        }
     }
 }
 
@@ -37,6 +52,7 @@ impl LogCollector for SshLogCollector {
         service: Option<&str>,
         window: &TimeWindow,
     ) -> Result<Vec<LogEntry>> {
+        self.clear_warnings();
         let services_to_query: Vec<&ServiceConfig> = match service {
             Some(name) => self.find_service(name).into_iter().collect(),
             None => self.services.iter().collect(),
@@ -70,13 +86,10 @@ impl LogCollector for SshLogCollector {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "SSH 采集 {}:{} traceId={} 失败: {}",
-                                svc.name,
-                                host,
-                                trace_id,
-                                e
-                            );
+                            let msg =
+                                format!("SSH 采集 {}:{} traceId={} 失败: {}", svc.name, host, trace_id, e);
+                            tracing::warn!("{}", msg);
+                            self.record_warning(msg);
                         }
                     }
                 }
@@ -91,6 +104,7 @@ impl LogCollector for SshLogCollector {
         service: Option<&str>,
         window: &TimeWindow,
     ) -> Result<Vec<LogEntry>> {
+        self.clear_warnings();
         let services_to_query: Vec<&ServiceConfig> = match service {
             Some(name) => self.find_service(name).into_iter().collect(),
             None => self.services.iter().collect(),
@@ -124,12 +138,10 @@ impl LogCollector for SshLogCollector {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "SSH 关键字采集 {}:{} 失败: {}",
-                                svc.name,
-                                host,
-                                e
-                            );
+                            let msg =
+                                format!("SSH 关键字采集 {}:{} 关键词={} 失败: {}", svc.name, host, keyword, e);
+                            tracing::warn!("{}", msg);
+                            self.record_warning(msg);
                         }
                     }
                 }
@@ -140,6 +152,13 @@ impl LogCollector for SshLogCollector {
 
     fn source_type(&self) -> &'static str {
         "ssh"
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        self.warnings
+            .lock()
+            .map(|warnings| warnings.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -263,5 +282,27 @@ mod tests {
         };
 
         assert_eq!(query_line_limit(&window, 100), 500);
+    }
+
+    #[test]
+    fn test_record_warning_stores_messages_for_reporting() {
+        let collector = SshLogCollector::new(
+            SshConfig {
+                port: 22,
+                username: "ops".into(),
+                auth_type: "password".into(),
+                private_key: None,
+                password: Some("pass".into()),
+            },
+            vec![],
+            100,
+        );
+
+        collector.record_warning("SSH 采集 pcm:host traceId=t1 失败: timeout".into());
+
+        assert_eq!(
+            collector.warnings(),
+            vec!["SSH 采集 pcm:host traceId=t1 失败: timeout".to_string()]
+        );
     }
 }

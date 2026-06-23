@@ -247,7 +247,8 @@ pub fn read_package(zip_path: &Path) -> Result<DiagnosisPackage> {
         Ok(mut f) => {
             let mut buf = String::new();
             f.read_to_string(&mut buf)?;
-            serde_json::from_str(&buf).unwrap_or_default()
+            serde_json::from_str(&buf)
+                .map_err(|e| anyhow::anyhow!("解析 database/sql-traces.json 失败: {}", e))?
         }
         Err(_) => vec![],
     };
@@ -257,7 +258,8 @@ pub fn read_package(zip_path: &Path) -> Result<DiagnosisPackage> {
         Ok(mut f) => {
             let mut buf = String::new();
             f.read_to_string(&mut buf)?;
-            serde_json::from_str(&buf).unwrap_or_default()
+            serde_json::from_str(&buf)
+                .map_err(|e| anyhow::anyhow!("解析 database/explain-plans.json 失败: {}", e))?
         }
         Err(_) => vec![],
     };
@@ -296,7 +298,10 @@ pub fn read_package(zip_path: &Path) -> Result<DiagnosisPackage> {
         Ok(mut f) => {
             let mut buf = String::new();
             f.read_to_string(&mut buf)?;
-            serde_json::from_str(&buf).ok()
+            Some(
+                serde_json::from_str(&buf)
+                    .map_err(|e| anyhow::anyhow!("解析 collection_report/report.json 失败: {}", e))?,
+            )
         }
         Err(_) => None,
     };
@@ -488,6 +493,19 @@ pub fn build_realtime_package_with_manifest(
         .as_bytes(),
     )?;
 
+    zip.start_file("realtime/request-cards.md", options)?;
+    zip.write_all(
+        render_realtime_request_cards_md(
+            &masked_page,
+            logs,
+            sql_traces,
+            explain_plans,
+            table_stats,
+            gateway_prefix,
+        )
+        .as_bytes(),
+    )?;
+
     zip.start_file("realtime/request-logs.md", options)?;
     zip.write_all(render_realtime_request_logs_md(&masked_page, logs).as_bytes())?;
 
@@ -542,6 +560,80 @@ fn render_realtime_overview_md(
     md
 }
 
+fn render_realtime_request_cards_md(
+    captured_page: &CapturedPage,
+    logs: &[LogEntry],
+    sql_traces: &[SqlTrace],
+    explain_plans: &[ExplainPlan],
+    table_stats: &[TableStats],
+    gateway_prefix: &str,
+) -> String {
+    let mut md = String::new();
+    md.push_str("# 实时请求排查卡片\n\n");
+    md.push_str(&format!("页面 URL：{}\n\n", captured_page.page_url));
+
+    let captured_trace_ids: HashSet<&str> = captured_page
+        .requests
+        .iter()
+        .filter_map(|request| request.trace_id.as_deref())
+        .filter(|id| !id.is_empty())
+        .collect();
+
+    for (idx, req) in captured_page.requests.iter().enumerate() {
+        let trace_id = req.trace_id.as_deref().filter(|id| !id.is_empty());
+        let request_logs = logs_for_trace(logs, trace_id);
+        let request_sql = sql_for_trace(sql_traces, trace_id);
+        let request_plans = plans_for_sqls(explain_plans, &request_sql);
+        let parsed = resolve_request(req, gateway_prefix);
+        let risk = classify_request_risk(req, &request_logs, &request_sql, &request_plans);
+        let trace_label = trace_id.unwrap_or("无 traceId");
+
+        md.push_str(&format!(
+            "## {}. [{}] x-trace：`{}`\n\n",
+            idx + 1,
+            risk,
+            trace_label,
+        ));
+        md.push_str(&render_request_card_meta(req, &parsed));
+        md.push_str(&render_request_diagnosis_summary(
+            req,
+            &request_logs,
+            &request_sql,
+            &request_plans,
+        ));
+        md.push_str(&render_request_key_logs(trace_id, &request_logs));
+        md.push_str(&render_request_sql_cards(
+            &request_sql,
+            &request_plans,
+            table_stats,
+        ));
+        md.push_str(&render_request_evidence_links(&request_logs, &request_sql));
+        md.push_str("---\n\n");
+    }
+
+    let unmatched: Vec<&LogEntry> = logs
+        .iter()
+        .filter(|entry| {
+            entry
+                .trace_id
+                .as_deref()
+                .map(|id| !captured_trace_ids.contains(id))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if !unmatched.is_empty() {
+        md.push_str("## 未匹配浏览器请求的日志\n\n```text\n");
+        for entry in sort_log_refs(unmatched) {
+            md.push_str(&format_log_line(entry));
+            md.push('\n');
+        }
+        md.push_str("```\n\n");
+    }
+
+    md
+}
+
 struct RequestTarget {
     service: String,
     api_path: String,
@@ -557,6 +649,98 @@ fn resolve_request(req: &CapturedRequest, gateway_prefix: &str) -> RequestTarget
             service: "unknown".to_string(),
             api_path: req.url.clone(),
         },
+    }
+}
+
+fn render_request_card_meta(req: &CapturedRequest, target: &RequestTarget) -> String {
+    let end_time = request_end_time(&req.timestamp, req.duration_ms);
+    format!(
+        "### 请求信息\n\n| 项目 | 值 |\n|------|-----|\n| Request URL | `{}` |\n| Method / Status | {} / {} |\n| startTime | {} |\n| endTime | {} |\n| duration | {} ms |\n| 入口服务 | {} |\n\n",
+        req.url,
+        req.method,
+        req.status,
+        req.timestamp,
+        end_time,
+        req.duration_ms,
+        target.service,
+    )
+}
+
+fn render_request_diagnosis_summary(
+    req: &CapturedRequest,
+    logs: &[&LogEntry],
+    sql_traces: &[&SqlTrace],
+    plans: &[&ExplainPlan],
+) -> String {
+    let conclusion = request_conclusion(req, logs);
+    let evidence = request_evidence(req, logs, sql_traces, plans);
+    let priority = request_priority(sql_traces, plans, logs);
+    format!(
+        "### 初步判断\n\n- 结论：{}\n- 主要证据：{}\n- 建议优先排查：{}\n\n",
+        conclusion, evidence, priority
+    )
+}
+
+fn request_conclusion(req: &CapturedRequest, logs: &[&LogEntry]) -> &'static str {
+    if req.status >= 500 || logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("ERROR")) {
+        "接口异常"
+    } else if req.duration_ms > 2000 {
+        "慢请求"
+    } else if req.status >= 400 || logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("WARN")) {
+        "日志告警"
+    } else {
+        "暂无明显异常"
+    }
+}
+
+fn request_evidence(
+    req: &CapturedRequest,
+    logs: &[&LogEntry],
+    sql_traces: &[&SqlTrace],
+    plans: &[&ExplainPlan],
+) -> String {
+    let mut evidence = Vec::new();
+    if req.status >= 500 {
+        evidence.push(format!("HTTP {}", req.status));
+    }
+    if logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("ERROR")) {
+        evidence.push("ERROR 日志".to_string());
+    }
+    if logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("WARN")) {
+        evidence.push("WARN 日志".to_string());
+    }
+    if req.duration_ms > 2000 {
+        evidence.push("慢请求".to_string());
+    }
+    if sql_traces
+        .iter()
+        .any(|trace| trace.duration_ms.map(|duration| duration > 1000.0).unwrap_or(false))
+    {
+        evidence.push("慢 SQL".to_string());
+    }
+    if plans.iter().any(|plan| plan.error.is_some()) {
+        evidence.push("EXPLAIN 失败".to_string());
+    }
+    if evidence.is_empty() {
+        "未发现明显异常信号".to_string()
+    } else {
+        evidence.join("、")
+    }
+}
+
+fn request_priority(
+    sql_traces: &[&SqlTrace],
+    plans: &[&ExplainPlan],
+    logs: &[&LogEntry],
+) -> String {
+    if plans.iter().any(|plan| plan.error.is_some()) {
+        "SQL 执行计划失败原因".to_string()
+    } else if !sql_traces.is_empty() {
+        "相关 SQL、表数据量与索引".to_string()
+    } else if logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("ERROR")) {
+        "异常日志和堆栈".to_string()
+    } else {
+        "请求状态、耗时和关联服务日志".to_string()
     }
 }
 
@@ -592,6 +776,279 @@ fn plans_for_sqls<'a>(
                 .any(|trace| trace.sql_fingerprint == plan.sql_fingerprint)
         })
         .collect()
+}
+
+fn render_request_key_logs(trace_id: Option<&str>, logs: &[&LogEntry]) -> String {
+    let mut md = String::new();
+    md.push_str("### 关键日志\n\n");
+    if trace_id.is_none() {
+        md.push_str("> 无 traceId，无法关联日志\n\n");
+        return md;
+    }
+    if logs.is_empty() {
+        md.push_str("> 未查询到该 traceId 的日志\n\n");
+        return md;
+    }
+
+    let key_logs: Vec<&LogEntry> = logs
+        .iter()
+        .copied()
+        .filter(|entry| is_key_log(entry))
+        .collect();
+    let display_logs = if key_logs.is_empty() {
+        sort_log_refs(logs.to_vec())
+    } else {
+        sort_log_refs(key_logs)
+    };
+
+    md.push_str("```text\n");
+    for entry in display_logs {
+        md.push_str(&format_log_line(entry));
+        md.push('\n');
+        if let Some(stack) = entry.stack_trace.as_deref().filter(|stack| !stack.trim().is_empty()) {
+            md.push_str(stack);
+            md.push('\n');
+        }
+    }
+    md.push_str("```\n\n");
+    md
+}
+
+fn is_key_log(entry: &LogEntry) -> bool {
+    let level = entry.level.as_str();
+    let msg = entry.message.as_str();
+    level.eq_ignore_ascii_case("ERROR")
+        || level.eq_ignore_ascii_case("WARN")
+        || entry.exception.is_some()
+        || entry.stack_trace.is_some()
+        || msg.contains("RequestUrl:")
+        || msg.contains("==>  Preparing:")
+        || msg.contains("==> Preparing:")
+        || msg.contains("==> Parameters:")
+        || msg.contains("<==      Total:")
+}
+
+fn sort_log_refs(mut logs: Vec<&LogEntry>) -> Vec<&LogEntry> {
+    logs.sort_by(|a, b| {
+        a.time
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.time.as_deref().unwrap_or(""))
+            .then_with(|| a.service.cmp(&b.service))
+    });
+    logs
+}
+
+fn render_request_sql_cards(
+    sql_traces: &[&SqlTrace],
+    plans: &[&ExplainPlan],
+    table_stats: &[TableStats],
+) -> String {
+    let mut md = String::new();
+    md.push_str("### 相关 SQL 与执行计划\n\n");
+    if sql_traces.is_empty() {
+        md.push_str("> 未匹配到该请求的 SQL\n\n");
+        return md;
+    }
+
+    let mut stats_map: HashMap<&str, Vec<&TableStats>> = HashMap::new();
+    for stat in table_stats {
+        stats_map.entry(stat.table_name.as_str()).or_default().push(stat);
+    }
+
+    for (idx, trace) in sql_traces.iter().enumerate() {
+        let trace_plans: Vec<&ExplainPlan> = plans
+            .iter()
+            .copied()
+            .filter(|plan| plan.sql_fingerprint == trace.sql_fingerprint)
+            .collect();
+        md.push_str(&render_request_sql_card(
+            idx + 1,
+            trace,
+            &trace_plans,
+            &stats_map,
+        ));
+    }
+
+    md
+}
+
+fn render_request_sql_card(
+    idx: usize,
+    trace: &SqlTrace,
+    plans: &[&ExplainPlan],
+    stats_map: &HashMap<&str, Vec<&TableStats>>,
+) -> String {
+    let title = trace
+        .tables
+        .first()
+        .map(|table| display_table_name(table, stats_map))
+        .unwrap_or_else(|| "SQL 查询".to_string());
+    let executed_sql = executable_sql_for_trace(trace, plans);
+    let explain_status = if plans.iter().any(|plan| plan.error.is_some()) {
+        "失败"
+    } else if plans.is_empty() {
+        "无"
+    } else {
+        "成功"
+    };
+
+    let mut md = String::new();
+    md.push_str(&format!("#### SQL {}：{}\n\n", idx, title));
+    md.push_str("| 项目 | 值 |\n");
+    md.push_str("|------|-----|\n");
+    md.push_str(&format!("| traceId | `{}` |\n", trace.trace_id));
+    md.push_str(&format!("| 服务 | {} |\n", trace.service));
+    if let Some(ts) = &trace.timestamp {
+        md.push_str(&format!("| 时间 | {} |\n", ts));
+    }
+    if let Some(duration) = trace.duration_ms {
+        md.push_str(&format!("| 耗时 | {:.2} ms |\n", duration));
+    }
+    if !trace.tables.is_empty() {
+        let tables: Vec<String> = trace
+            .tables
+            .iter()
+            .map(|table| display_table_name(table, stats_map))
+            .collect();
+        md.push_str(&format!("| 涉及表 | {} |\n", tables.join(", ")));
+    }
+    md.push_str(&format!("| 参数状态 | {} |\n", parameter_status(trace, plans)));
+    md.push_str(&format!("| EXPLAIN 状态 | {} |\n\n", explain_status));
+
+    md.push_str("```sql\n");
+    md.push_str(&executed_sql);
+    md.push_str("\n```\n\n");
+
+    md.push_str(&render_request_table_stats(&trace.tables, stats_map));
+    md.push_str(&render_request_explain_plans(plans));
+    md
+}
+
+fn parameter_status(trace: &SqlTrace, plans: &[&ExplainPlan]) -> &'static str {
+    if plans.iter().any(|plan| {
+        plan.error
+            .as_deref()
+            .map(|error| error.contains("参数未完整拼装") || error.contains("? 占位符"))
+            .unwrap_or(false)
+    }) {
+        "参数缺失"
+    } else if trace
+        .parameters
+        .as_deref()
+        .map(|params| !params.trim().is_empty())
+        .unwrap_or(false)
+        || trace_specific_executed_sql(trace, plans).is_some()
+    {
+        "已拼装"
+    } else {
+        "参数缺失"
+    }
+}
+
+fn display_table_name(table: &str, stats_map: &HashMap<&str, Vec<&TableStats>>) -> String {
+    match stats_map.get(table).and_then(|stats| stats.first()) {
+        Some(stats) if !stats.schema.is_empty() => format!("{}.{}", stats.schema, table),
+        _ => table.to_string(),
+    }
+}
+
+fn render_request_table_stats(
+    tables: &[String],
+    stats_map: &HashMap<&str, Vec<&TableStats>>,
+) -> String {
+    if tables.is_empty() {
+        return String::new();
+    }
+
+    let mut md = String::new();
+    md.push_str("**表数据量与索引：**\n\n");
+    md.push_str("| 表名 | 行数 | 数据大小 | 索引数 | 索引列表 |\n");
+    md.push_str("|------|------|----------|--------|----------|\n");
+    for table in tables {
+        if let Some(stats_list) = stats_map.get(table.as_str()) {
+            for stats in stats_list {
+                let idx_list: Vec<String> = stats
+                    .indexes
+                    .iter()
+                    .map(|index| {
+                        let unique = if index.unique { " UNIQUE" } else { "" };
+                        format!("`{}({}){}`", index.name, index.columns.join(","), unique)
+                    })
+                    .collect();
+                let table_display = if stats.schema.is_empty() {
+                    table.clone()
+                } else {
+                    format!("{}.{}", stats.schema, table)
+                };
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {} |\n",
+                    table_display,
+                    format_number(stats.row_count),
+                    stats
+                        .data_size_bytes
+                        .map(|size| format!("{} bytes", format_number(size)))
+                        .unwrap_or_else(|| "-".to_string()),
+                    stats.indexes.len(),
+                    if idx_list.is_empty() {
+                        "-".to_string()
+                    } else {
+                        idx_list.join("<br>")
+                    },
+                ));
+            }
+        } else {
+            md.push_str(&format!("| {} | - | - | - | - |\n", table));
+        }
+    }
+    md.push('\n');
+    md
+}
+
+fn render_request_explain_plans(plans: &[&ExplainPlan]) -> String {
+    if plans.is_empty() {
+        return "**执行计划：** 无（未匹配到 EXPLAIN 结果）\n\n".to_string();
+    }
+
+    let mut md = String::new();
+    for plan in plans {
+        let source_suffix = if let Some(schema) = &plan.found_in_schema {
+            format!("{} - 来自 schema: {}", plan.source, schema)
+        } else {
+            plan.source.clone()
+        };
+        md.push_str(&format!("**执行计划（{}）：**\n\n", source_suffix));
+        if let Some(err) = &plan.error {
+            md.push_str(&format!("> ⚠ EXPLAIN 执行失败：`{}`\n\n", err));
+        } else {
+            md.push_str(&render_explain_plan_md(plan));
+            md.push('\n');
+        }
+    }
+    md
+}
+
+fn render_request_evidence_links(logs: &[&LogEntry], sql_traces: &[&SqlTrace]) -> String {
+    let mut services: Vec<&str> = logs
+        .iter()
+        .map(|entry| entry.service.as_str())
+        .chain(sql_traces.iter().map(|trace| trace.service.as_str()))
+        .collect();
+    services.sort_unstable();
+    services.dedup();
+
+    let mut md = String::new();
+    md.push_str("### 完整证据\n\n");
+    if services.is_empty() {
+        md.push_str("- 未关联到服务级原始日志\n\n");
+        return md;
+    }
+    for service in services {
+        md.push_str(&format!("- 完整服务日志：`{}.txt`\n", service));
+        md.push_str(&format!("- 服务 SQL 报告：`{}_sql.md`\n", service));
+    }
+    md.push('\n');
+    md
 }
 
 fn classify_request_risk(
@@ -638,6 +1095,28 @@ fn format_explain_status(plans: &[&ExplainPlan]) -> String {
     let success = plans.iter().filter(|plan| plan.error.is_none()).count();
     let failed = plans.iter().filter(|plan| plan.error.is_some()).count();
     format!("{} 成功 / {} 失败", success, failed)
+}
+
+fn trace_specific_executed_sql(trace: &SqlTrace, plans: &[&ExplainPlan]) -> Option<String> {
+    plans
+        .iter()
+        .find(|plan| plan.trace_id.as_deref() == Some(trace.trace_id.as_str()))
+        .and_then(|plan| plan.executed_sql.clone())
+        .or_else(|| {
+            plans
+                .iter()
+                .find(|plan| plan.trace_id.is_none())
+                .and_then(|plan| plan.executed_sql.clone())
+        })
+}
+
+fn executable_sql_for_trace(trace: &SqlTrace, plans: &[&ExplainPlan]) -> String {
+    trace_specific_executed_sql(trace, plans).unwrap_or_else(|| match &trace.parameters {
+        Some(parameters) if !parameters.trim().is_empty() => {
+            crate::sql_parser::substitute_mybatis_parameters(&trace.sql, parameters)
+        }
+        _ => trace.sql.clone(),
+    })
 }
 
 fn write_quick_contents<W: Write + std::io::Seek>(
@@ -837,13 +1316,8 @@ fn render_sql_trace_md(
     // 拼装后的可执行 SQL（优先取 explain_map 中的 executed_sql；否则用 trace.sql 自行拼装）
     let executed = explain_map
         .get(trace.sql_fingerprint.as_str())
-        .and_then(|plans| plans.iter().find_map(|p| p.executed_sql.clone()))
-        .unwrap_or_else(|| match &trace.parameters {
-            Some(p) if !p.trim().is_empty() => {
-                crate::sql_parser::substitute_mybatis_parameters(&trace.sql, p)
-            }
-            _ => trace.sql.clone(),
-        });
+        .map(|plans| executable_sql_for_trace(trace, plans.as_slice()))
+        .unwrap_or_else(|| executable_sql_for_trace(trace, &[]));
 
     md.push_str("**SQL 语句（已拼装参数）：**\n\n```sql\n");
     md.push_str(&executed);

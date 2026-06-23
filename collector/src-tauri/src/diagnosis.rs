@@ -114,6 +114,7 @@ impl DiagnosisRunner {
                 Vec::new()
             }
         };
+        append_collector_warnings(&mut collection_errors, self.log_collector.as_ref());
 
         // Step 3b: 从日志中提取 SQL traces
         let sql_traces = crate::sql_extractor::extract_sql_traces(&all_logs);
@@ -392,6 +393,10 @@ fn collection_report(
     }
 }
 
+fn append_collector_warnings(errors: &mut Vec<String>, collector: &dyn LogCollector) {
+    errors.extend(collector.warnings());
+}
+
 fn sql_trace_table_names(sql_traces: &[SqlTrace]) -> Vec<String> {
     let mut names: Vec<String> = sql_traces
         .iter()
@@ -480,6 +485,8 @@ mod tests {
 
     struct StubLogCollector;
 
+    struct WarningCollector;
+
     #[async_trait]
     impl LogCollector for StubLogCollector {
         async fn query_by_trace_ids(
@@ -502,6 +509,35 @@ mod tests {
 
         fn source_type(&self) -> &'static str {
             "elk"
+        }
+    }
+
+    #[async_trait]
+    impl LogCollector for WarningCollector {
+        async fn query_by_trace_ids(
+            &self,
+            _trace_ids: &[String],
+            _service: Option<&str>,
+            _window: &TimeWindow,
+        ) -> Result<Vec<LogEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_by_keywords(
+            &self,
+            _keywords: &[String],
+            _service: Option<&str>,
+            _window: &TimeWindow,
+        ) -> Result<Vec<LogEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn source_type(&self) -> &'static str {
+            "ssh"
+        }
+
+        fn warnings(&self) -> Vec<String> {
+            vec!["SSH 采集 pcm:host traceId=t1 失败: timeout".into()]
         }
     }
 
@@ -708,6 +744,21 @@ mod tests {
         assert!(base
             .iter()
             .any(|s| s.schema == "outbound_platform" && s.row_count == 3));
+    }
+
+    #[test]
+    fn test_append_collector_warnings_preserves_partial_failures() {
+        let mut errors = vec!["DB 采集失败".to_string()];
+
+        append_collector_warnings(&mut errors, &WarningCollector);
+
+        assert_eq!(
+            errors,
+            vec![
+                "DB 采集失败".to_string(),
+                "SSH 采集 pcm:host traceId=t1 失败: timeout".to_string()
+            ]
+        );
     }
 
     #[test]

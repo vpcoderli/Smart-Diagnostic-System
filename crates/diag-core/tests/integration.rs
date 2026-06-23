@@ -10,6 +10,7 @@ use diag_core::package::{
     build_package, build_quick_package_with_manifest, build_realtime_package,
     build_realtime_package_with_manifest, read_package,
 };
+use std::io::Write;
 use tempfile::tempdir;
 
 // ─── Mock 数据工厂 ───
@@ -891,6 +892,196 @@ fn test_realtime_overview_counts_explain_for_shared_sql_fingerprint() {
         .unwrap();
 
     assert!(overview.contains("| 2 | SLOW | `trace-def456` | /v1/user/info | 200 | 150ms | pcm-user | ERROR=0 WARN=0 | 1 | 1 成功 / 0 失败 |"));
+}
+
+#[test]
+fn test_quick_sql_report_uses_trace_specific_executed_sql_for_shared_fingerprint() {
+    use diag_core::package::build_quick_package;
+    use std::io::Read;
+
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("shared-fingerprint-sql-report.zip");
+    let fingerprint = "select * from patient where id = ?".to_string();
+    let traces = vec![
+        SqlTrace {
+            trace_id: "trace-a".into(),
+            service: "pcm-management".into(),
+            sql: "select * from patient where id = ?".into(),
+            sql_fingerprint: fingerprint.clone(),
+            duration_ms: None,
+            tables: vec!["patient".into()],
+            timestamp: Some("2026-06-03T12:00:00+08:00".into()),
+            parameters: Some("1(Integer)".into()),
+        },
+        SqlTrace {
+            trace_id: "trace-b".into(),
+            service: "pcm-management".into(),
+            sql: "select * from patient where id = ?".into(),
+            sql_fingerprint: fingerprint.clone(),
+            duration_ms: None,
+            tables: vec!["patient".into()],
+            timestamp: Some("2026-06-03T12:00:01+08:00".into()),
+            parameters: Some("2(Integer)".into()),
+        },
+    ];
+    let plans = vec![ExplainPlan {
+        sql_fingerprint: fingerprint,
+        avg_duration_ms: 1.0,
+        source: "log_sql_explain".into(),
+        explain_rows: vec![],
+        table_stats: None,
+        trace_id: Some("trace-a".into()),
+        executed_sql: Some("select * from patient where id = 1".into()),
+        error: Some("fake explain failure".into()),
+        found_in_schema: None,
+    }];
+
+    build_quick_package(&[], &traces, &plans, &[], &zip_path).unwrap();
+
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+    let mut report = String::new();
+    archive
+        .by_name("pcm-management_sql.md")
+        .unwrap()
+        .read_to_string(&mut report)
+        .unwrap();
+
+    let trace_b_section = report
+        .split("| traceId | `trace-b` |")
+        .nth(1)
+        .expect("trace-b section missing");
+    assert!(trace_b_section.contains("select * from patient where id = 2"));
+    assert!(!trace_b_section.contains("select * from patient where id = 1"));
+}
+
+#[test]
+fn test_realtime_request_cards_use_trace_specific_sql_for_shared_fingerprint() {
+    use std::io::Read;
+
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("shared-fingerprint-cards.zip");
+    let (mut pkg, _) = mock_diagnosis_package();
+    let fingerprint = "select * from patient where id = ?".to_string();
+    pkg.sql_traces = vec![
+        SqlTrace {
+            trace_id: "trace-abc123".into(),
+            service: "pcm-management".into(),
+            sql: "select * from patient where id = ?".into(),
+            sql_fingerprint: fingerprint.clone(),
+            duration_ms: None,
+            tables: vec!["patient".into()],
+            timestamp: Some("2026-06-03T12:00:00+08:00".into()),
+            parameters: Some("1(Integer)".into()),
+        },
+        SqlTrace {
+            trace_id: "trace-def456".into(),
+            service: "pcm-user".into(),
+            sql: "select * from patient where id = ?".into(),
+            sql_fingerprint: fingerprint.clone(),
+            duration_ms: None,
+            tables: vec!["patient".into()],
+            timestamp: Some("2026-06-03T12:00:01+08:00".into()),
+            parameters: Some("2(Integer)".into()),
+        },
+    ];
+    pkg.explain_plans = vec![ExplainPlan {
+        sql_fingerprint: fingerprint,
+        avg_duration_ms: 1.0,
+        source: "log_sql_explain".into(),
+        explain_rows: vec![],
+        table_stats: None,
+        trace_id: Some("trace-abc123".into()),
+        executed_sql: Some("select * from patient where id = 1".into()),
+        error: Some("fake explain failure".into()),
+        found_in_schema: None,
+    }];
+
+    build_realtime_package(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/gateway",
+        &zip_path,
+    )
+    .unwrap();
+
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+    let mut cards = String::new();
+    archive
+        .by_name("realtime/request-cards.md")
+        .unwrap()
+        .read_to_string(&mut cards)
+        .unwrap();
+
+    let trace_b_card = cards.split("## 2.").nth(1).expect("second card missing");
+    assert!(trace_b_card.contains("select * from patient where id = 2"));
+    assert!(!trace_b_card.contains("select * from patient where id = 1"));
+}
+
+#[test]
+fn test_read_package_errors_on_malformed_sql_traces_json() {
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("bad-sql-traces.zip");
+    let (pkg, masking) = mock_diagnosis_package();
+    build_package(&pkg, &masking, &zip_path).unwrap();
+
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("manifest.json", options).unwrap();
+    zip.write_all(
+        serde_json::to_string_pretty(&pkg.manifest)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    zip.start_file("browser/requests.json", options).unwrap();
+    zip.write_all(
+        serde_json::to_string_pretty(&pkg.captured_page.requests)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    zip.start_file("database/sql-traces.json", options).unwrap();
+    zip.write_all(b"not json").unwrap();
+    zip.finish().unwrap();
+
+    let err = read_package(&zip_path).expect_err("malformed sql-traces should fail import");
+    assert!(err.to_string().contains("sql-traces") || err.to_string().contains("expected"));
+}
+
+#[test]
+fn test_read_package_errors_on_malformed_collection_report_json() {
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("bad-report.zip");
+    let (pkg, _) = mock_diagnosis_package();
+
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("manifest.json", options).unwrap();
+    zip.write_all(
+        serde_json::to_string_pretty(&pkg.manifest)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    zip.start_file("browser/requests.json", options).unwrap();
+    zip.write_all(
+        serde_json::to_string_pretty(&pkg.captured_page.requests)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    zip.start_file("collection_report/report.json", options)
+        .unwrap();
+    zip.write_all(b"not json").unwrap();
+    zip.finish().unwrap();
+
+    let err = read_package(&zip_path).expect_err("malformed collection report should fail import");
+    assert!(err.to_string().contains("collection_report") || err.to_string().contains("expected"));
 }
 
 #[test]
