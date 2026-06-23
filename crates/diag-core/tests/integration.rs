@@ -624,6 +624,7 @@ fn test_realtime_package_with_manifest_preserves_metadata_and_collection_report(
     let dir = tempdir().unwrap();
     let zip_path = dir.path().join("realtime-manifest-report-test.zip");
     let (mut pkg, _) = mock_diagnosis_package();
+    let privacy = mock_collector_config().privacy;
     pkg.manifest.diagnosis_id = "diag-real-001".into();
     pkg.manifest.site = "real-hospital".into();
     pkg.manifest.system = "pcm-real".into();
@@ -653,6 +654,7 @@ fn test_realtime_package_with_manifest_preserves_metadata_and_collection_report(
         "/custom-gateway",
         &pkg.manifest,
         Some(&report),
+        &privacy,
         &zip_path,
     )
     .unwrap();
@@ -684,6 +686,56 @@ fn test_realtime_package_with_manifest_preserves_metadata_and_collection_report(
         loaded_report.skipped_services,
         vec!["unknown（URL 无法解析服务名）".to_string()]
     );
+}
+
+#[test]
+fn test_realtime_package_with_manifest_uses_supplied_privacy_config() {
+    use std::io::Read;
+
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("realtime-custom-privacy-test.zip");
+    let (mut pkg, _) = mock_diagnosis_package();
+    pkg.captured_page.page_url =
+        "http://10.0.0.1/page?status=OPEN&pageNum=1&patientName=赵六".into();
+    pkg.manifest.page_url = pkg.captured_page.page_url.clone();
+    pkg.captured_page.requests[0].url = "http://10.0.0.1/gateway/pcm-management/v1/patient/list?status=OPEN&pageNum=1&patientName=赵六".into();
+    let privacy = PrivacyConfig {
+        mask_query_values: true,
+        allowed_query_keys: vec!["pageNum".into()],
+    };
+
+    build_realtime_package_with_manifest(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/gateway",
+        &pkg.manifest,
+        None,
+        &privacy,
+        &zip_path,
+    )
+    .unwrap();
+
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+    let mut request_logs = String::new();
+    archive
+        .by_name("realtime/request-logs.md")
+        .unwrap()
+        .read_to_string(&mut request_logs)
+        .unwrap();
+    assert!(request_logs.contains("pageNum=1"));
+    assert!(!request_logs.contains("status=OPEN"));
+    assert!(!request_logs.contains("赵六"));
+    drop(archive);
+
+    let loaded = read_package(&zip_path).unwrap();
+    assert!(loaded.manifest.page_url.contains("pageNum=1"));
+    assert!(!loaded.manifest.page_url.contains("status=OPEN"));
+    assert!(!loaded.manifest.page_url.contains("赵六"));
+    assert!(loaded.captured_page.requests[0].url.contains("pageNum=1"));
+    assert!(!loaded.captured_page.requests[0].url.contains("status=OPEN"));
 }
 
 #[test]

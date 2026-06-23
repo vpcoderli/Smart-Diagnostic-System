@@ -185,12 +185,11 @@ fn default_report_privacy_config() -> PrivacyConfig {
     }
 }
 
-fn masked_captured_page(captured_page: &CapturedPage) -> CapturedPage {
-    let privacy = default_report_privacy_config();
+fn masked_captured_page(captured_page: &CapturedPage, privacy: &PrivacyConfig) -> CapturedPage {
     let mut masked_page = captured_page.clone();
-    masked_page.page_url = masking::mask_url(&captured_page.page_url, &privacy);
+    masked_page.page_url = masking::mask_url(&captured_page.page_url, privacy);
     for request in &mut masked_page.requests {
-        request.url = mask_captured_request_url(&request.url, &captured_page.page_url, &privacy);
+        request.url = mask_captured_request_url(&request.url, &captured_page.page_url, privacy);
     }
     masked_page
 }
@@ -359,7 +358,8 @@ pub fn build_realtime_package(
     gateway_prefix: &str,
     output_path: &Path,
 ) -> Result<()> {
-    let masked_page = masked_captured_page(captured_page);
+    let privacy = default_report_privacy_config();
+    let masked_page = masked_captured_page(captured_page, &privacy);
     let manifest = synthetic_manifest(
         &masked_page,
         logs,
@@ -377,6 +377,7 @@ pub fn build_realtime_package(
         gateway_prefix,
         &manifest,
         None,
+        &privacy,
         output_path,
     )
 }
@@ -437,6 +438,7 @@ pub fn build_realtime_package_with_manifest(
     gateway_prefix: &str,
     manifest: &DiagnosisManifest,
     collection_report: Option<&CollectionReport>,
+    privacy: &PrivacyConfig,
     output_path: &Path,
 ) -> Result<()> {
     if let Some(parent) = output_path.parent() {
@@ -447,7 +449,7 @@ pub fn build_realtime_package_with_manifest(
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
-    let masked_page = masked_captured_page(captured_page);
+    let masked_page = masked_captured_page(captured_page, privacy);
     let mut manifest = manifest.clone();
     manifest.page_url = masked_page.page_url.clone();
     manifest.request_count = masked_page.requests.len();

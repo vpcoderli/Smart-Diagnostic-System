@@ -197,6 +197,7 @@ impl DiagnosisRunner {
                 self.config.gateway.prefix.as_str(),
                 &manifest,
                 Some(&report),
+                &self.config.privacy,
                 &output_path,
             )?;
         } else {
@@ -418,24 +419,29 @@ fn merge_table_stats(base: &mut Vec<TableStats>, extra: Vec<TableStats>) {
 }
 
 fn realtime_time_window(captured: &CapturedPage) -> TimeWindow {
-    let parsed: Vec<DateTime<FixedOffset>> = captured
+    let spans: Vec<(DateTime<FixedOffset>, DateTime<FixedOffset>)> = captured
         .requests
         .iter()
-        .filter_map(|request| DateTime::parse_from_rfc3339(&request.timestamp).ok())
+        .filter_map(|request| {
+            let end = DateTime::parse_from_rfc3339(&request.timestamp).ok()?;
+            let duration_ms = request.duration_ms.min(i64::MAX as u64) as i64;
+            let start = end - Duration::milliseconds(duration_ms);
+            Some((start, end))
+        })
         .collect();
 
-    if parsed.is_empty() {
+    if spans.is_empty() {
         return TimeWindow {
             start: String::new(),
             end: String::new(),
         };
     }
 
-    let min_ts = parsed.iter().min().cloned().unwrap();
-    let max_ts = parsed.iter().max().cloned().unwrap();
+    let min_start = spans.iter().map(|(start, _)| *start).min().unwrap();
+    let max_end = spans.iter().map(|(_, end)| *end).max().unwrap();
     TimeWindow {
-        start: (min_ts - Duration::minutes(5)).to_rfc3339(),
-        end: (max_ts + Duration::minutes(5)).to_rfc3339(),
+        start: (min_start - Duration::minutes(5)).to_rfc3339(),
+        end: (max_end + Duration::minutes(5)).to_rfc3339(),
     }
 }
 
@@ -721,8 +727,29 @@ mod tests {
         };
 
         let window = realtime_time_window(&captured);
-        assert_eq!(window.start, "2026-06-03T11:55:00+00:00");
+        assert_eq!(window.start, "2026-06-03T11:54:59.850+00:00");
         assert_eq!(window.end, "2026-06-03T12:05:00+00:00");
+    }
+
+    #[test]
+    fn test_realtime_time_window_uses_request_start_and_end_with_padding() {
+        let captured = CapturedPage {
+            page_url: "http://host/page".into(),
+            requests: vec![CapturedRequest {
+                method: "GET".into(),
+                url: "http://host/gateway/pcm-management/v1/list".into(),
+                status: 200,
+                duration_ms: 420_000,
+                trace_id: Some("trace-1".into()),
+                timestamp: "2026-06-03T12:10:00Z".into(),
+                request_type: "fetch".into(),
+                response_size: None,
+            }],
+        };
+
+        let window = realtime_time_window(&captured);
+        assert_eq!(window.start, "2026-06-03T11:58:00+00:00");
+        assert_eq!(window.end, "2026-06-03T12:15:00+00:00");
     }
 
     #[test]
