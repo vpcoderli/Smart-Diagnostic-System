@@ -1,10 +1,12 @@
+use crate::config::PrivacyConfig;
+use crate::masking;
 use crate::models::{
     CapturedPage, CapturedRequest, DiagnosisManifest, DiagnosisPackage, ExplainPlan, LogEntry,
     MaskingReport, SqlTrace, TableStats,
 };
 use crate::url_resolver;
 use anyhow::Result;
-use chrono::{DateTime, Duration, FixedOffset};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -20,60 +22,20 @@ pub fn build_package(
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
-    // manifest.json
-    zip.start_file("manifest.json", options)?;
-    zip.write_all(serde_json::to_string_pretty(&package.manifest)?.as_bytes())?;
+    write_structured_contents(
+        &mut zip,
+        options,
+        &package.manifest,
+        &package.captured_page,
+        &package.logs,
+        &package.sql_traces,
+        &package.explain_plans,
+        &package.table_stats,
+    )?;
 
-    // browser/page.json
-    zip.start_file("browser/page.json", options)?;
-    let page_info = serde_json::json!({ "pageUrl": package.captured_page.page_url });
-    zip.write_all(serde_json::to_string_pretty(&page_info)?.as_bytes())?;
-
-    // browser/requests.json
-    zip.start_file("browser/requests.json", options)?;
-    zip.write_all(serde_json::to_string_pretty(&package.captured_page.requests)?.as_bytes())?;
-
-    // services/{service}/app-log.jsonl
-    // 正确：先按 service 分组，每个服务只 start_file 一次
-    let mut by_service: std::collections::HashMap<&str, Vec<&crate::models::LogEntry>> =
-        std::collections::HashMap::new();
-    for log in &package.logs {
-        by_service
-            .entry(log.service.as_str())
-            .or_default()
-            .push(log);
-    }
-    for (svc, entries) in &by_service {
-        let file_path = format!("services/{}/app-log.jsonl", svc);
-        zip.start_file(&file_path, options)?;
-        for entry in entries {
-            zip.write_all(serde_json::to_string(entry)?.as_bytes())?;
-            zip.write_all(b"\n")?;
-        }
-    }
-
-    // database/slow-sql.json
     if !package.slow_sqls.is_empty() {
         zip.start_file("database/slow-sql.json", options)?;
         zip.write_all(serde_json::to_string_pretty(&package.slow_sqls)?.as_bytes())?;
-    }
-
-    // database/sql-traces.json
-    if !package.sql_traces.is_empty() {
-        zip.start_file("database/sql-traces.json", options)?;
-        zip.write_all(serde_json::to_string_pretty(&package.sql_traces)?.as_bytes())?;
-    }
-
-    // database/explain-plans.json
-    if !package.explain_plans.is_empty() {
-        zip.start_file("database/explain-plans.json", options)?;
-        zip.write_all(serde_json::to_string_pretty(&package.explain_plans)?.as_bytes())?;
-    }
-
-    // database/table-stats.json
-    if !package.table_stats.is_empty() {
-        zip.start_file("database/table-stats.json", options)?;
-        zip.write_all(serde_json::to_string_pretty(&package.table_stats)?.as_bytes())?;
     }
 
     // privacy/masking-report.json
@@ -88,6 +50,149 @@ pub fn build_package(
 
     zip.finish()?;
     Ok(())
+}
+
+fn write_structured_contents<W: Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    options: zip::write::SimpleFileOptions,
+    manifest: &DiagnosisManifest,
+    captured_page: &CapturedPage,
+    logs: &[LogEntry],
+    sql_traces: &[SqlTrace],
+    explain_plans: &[ExplainPlan],
+    table_stats: &[TableStats],
+) -> Result<()> {
+    zip.start_file("manifest.json", options)?;
+    zip.write_all(serde_json::to_string_pretty(manifest)?.as_bytes())?;
+
+    zip.start_file("browser/page.json", options)?;
+    let page_info = serde_json::json!({ "pageUrl": captured_page.page_url });
+    zip.write_all(serde_json::to_string_pretty(&page_info)?.as_bytes())?;
+
+    zip.start_file("browser/requests.json", options)?;
+    zip.write_all(serde_json::to_string_pretty(&captured_page.requests)?.as_bytes())?;
+
+    let mut logs_by_service: HashMap<&str, Vec<&LogEntry>> = HashMap::new();
+    for log in logs {
+        logs_by_service.entry(log.service.as_str()).or_default().push(log);
+    }
+    for (service, entries) in &logs_by_service {
+        let file_path = format!("services/{}/app-log.jsonl", service);
+        zip.start_file(&file_path, options)?;
+        for entry in entries {
+            zip.write_all(serde_json::to_string(entry)?.as_bytes())?;
+            zip.write_all(b"\n")?;
+        }
+    }
+
+    if !sql_traces.is_empty() {
+        zip.start_file("database/sql-traces.json", options)?;
+        zip.write_all(serde_json::to_string_pretty(sql_traces)?.as_bytes())?;
+    }
+
+    if !explain_plans.is_empty() {
+        zip.start_file("database/explain-plans.json", options)?;
+        zip.write_all(serde_json::to_string_pretty(explain_plans)?.as_bytes())?;
+    }
+
+    if !table_stats.is_empty() {
+        zip.start_file("database/table-stats.json", options)?;
+        zip.write_all(serde_json::to_string_pretty(table_stats)?.as_bytes())?;
+    }
+
+    Ok(())
+}
+
+fn synthetic_manifest(
+    captured_page: &CapturedPage,
+    logs: &[LogEntry],
+    sql_traces: &[SqlTrace],
+    collection_mode: &str,
+    diagnosis_id: &str,
+    gateway_prefix: Option<&str>,
+) -> DiagnosisManifest {
+    let mut services: Vec<String> = logs
+        .iter()
+        .map(|log| log.service.clone())
+        .chain(sql_traces.iter().map(|trace| trace.service.clone()))
+        .filter(|service| !service.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    services.sort();
+
+    let mut trace_ids: Vec<String> = captured_page
+        .requests
+        .iter()
+        .filter_map(|request| request.trace_id.clone())
+        .chain(logs.iter().filter_map(|log| log.trace_id.clone()))
+        .chain(
+            sql_traces
+                .iter()
+                .map(|trace| trace.trace_id.clone())
+                .filter(|trace_id| !trace_id.is_empty()),
+        )
+        .filter(|trace_id| !trace_id.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    trace_ids.sort();
+
+    DiagnosisManifest {
+        diagnosis_id: diagnosis_id.to_string(),
+        site: "unknown".into(),
+        system: "unknown".into(),
+        created_at: Utc::now().to_rfc3339(),
+        page_url: captured_page.page_url.clone(),
+        request_count: captured_page.requests.len(),
+        services,
+        trace_ids,
+        database_type: "unknown".into(),
+        privacy_level: "MASKED".into(),
+        collector_version: "quick".into(),
+        collection_mode: Some(collection_mode.to_string()),
+        log_source: None,
+        gateway_prefix: gateway_prefix.map(str::to_string),
+        keywords: None,
+        time_range: None,
+    }
+}
+
+fn default_report_privacy_config() -> PrivacyConfig {
+    PrivacyConfig {
+        mask_query_values: true,
+        allowed_query_keys: vec![
+            "pageNum".into(),
+            "pageSize".into(),
+            "portal".into(),
+            "type".into(),
+            "status".into(),
+        ],
+    }
+}
+
+fn masked_captured_page(captured_page: &CapturedPage) -> CapturedPage {
+    let privacy = default_report_privacy_config();
+    let mut masked_page = captured_page.clone();
+    for request in &mut masked_page.requests {
+        request.url = mask_captured_request_url(&request.url, &captured_page.page_url, &privacy);
+    }
+    masked_page
+}
+
+fn mask_captured_request_url(raw_url: &str, page_url: &str, privacy: &PrivacyConfig) -> String {
+    if url::Url::parse(raw_url).is_ok() {
+        return masking::mask_url(raw_url, privacy);
+    }
+
+    let Ok(base_url) = url::Url::parse(page_url) else {
+        return raw_url.to_string();
+    };
+    let Ok(joined_url) = base_url.join(raw_url) else {
+        return raw_url.to_string();
+    };
+
+    masking::mask_url(joined_url.as_ref(), privacy)
 }
 
 /// 从 diagnosis.zip 读取诊断包
@@ -214,6 +319,29 @@ pub fn build_quick_package(
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
+    let captured_page = CapturedPage {
+        page_url: "quick".into(),
+        requests: Vec::new(),
+    };
+    let manifest = synthetic_manifest(
+        &captured_page,
+        logs,
+        sql_traces,
+        "quick",
+        "quick-package",
+        None,
+    );
+
+    write_structured_contents(
+        &mut zip,
+        options,
+        &manifest,
+        &captured_page,
+        logs,
+        sql_traces,
+        explain_plans,
+        table_stats,
+    )?;
 
     write_quick_contents(
         &mut zip,
@@ -246,6 +374,26 @@ pub fn build_realtime_package(
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
+    let masked_page = masked_captured_page(captured_page);
+    let manifest = synthetic_manifest(
+        &masked_page,
+        logs,
+        sql_traces,
+        "realtime",
+        "realtime-package",
+        Some(gateway_prefix),
+    );
+
+    write_structured_contents(
+        &mut zip,
+        options,
+        &manifest,
+        &masked_page,
+        logs,
+        sql_traces,
+        explain_plans,
+        table_stats,
+    )?;
 
     write_quick_contents(
         &mut zip,
@@ -259,7 +407,7 @@ pub fn build_realtime_package(
     zip.start_file("realtime/overview.md", options)?;
     zip.write_all(
         render_realtime_overview_md(
-            captured_page,
+            &masked_page,
             logs,
             sql_traces,
             explain_plans,
@@ -269,7 +417,7 @@ pub fn build_realtime_package(
     )?;
 
     zip.start_file("realtime/request-logs.md", options)?;
-    zip.write_all(render_realtime_request_logs_md(captured_page, logs).as_bytes())?;
+    zip.write_all(render_realtime_request_logs_md(&masked_page, logs).as_bytes())?;
 
     zip.finish()?;
     Ok(())
@@ -360,22 +508,12 @@ fn plans_for_sqls<'a>(
     explain_plans: &'a [ExplainPlan],
     sql_traces: &[&SqlTrace],
 ) -> Vec<&'a ExplainPlan> {
-    let trace_ids: HashSet<&str> = sql_traces
-        .iter()
-        .map(|trace| trace.trace_id.as_str())
-        .collect();
     explain_plans
         .iter()
         .filter(|plan| {
-            let fingerprint_match = sql_traces
+            sql_traces
                 .iter()
-                .any(|trace| trace.sql_fingerprint == plan.sql_fingerprint);
-            let trace_match = plan
-                .trace_id
-                .as_deref()
-                .map(|id| trace_ids.contains(id))
-                .unwrap_or(true);
-            fingerprint_match && trace_match
+                .any(|trace| trace.sql_fingerprint == plan.sql_fingerprint)
         })
         .collect()
 }

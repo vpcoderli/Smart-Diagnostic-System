@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use diag_core::collector_trait::LogCollector;
 use diag_core::config::CollectorConfig;
 use diag_core::models::*;
@@ -70,17 +70,7 @@ impl DiagnosisRunner {
 
         // Step 2: 从请求时间戳推算时间窗（前后各加 5 分钟）
         let window = if let Some(captured) = &self.captured {
-            let timestamps: Vec<&str> = captured
-                .requests
-                .iter()
-                .map(|r| r.timestamp.as_str())
-                .collect();
-            let min_ts = timestamps.iter().min().copied().unwrap_or("");
-            let max_ts = timestamps.iter().max().copied().unwrap_or("");
-            TimeWindow {
-                start: min_ts.to_string(),
-                end: max_ts.to_string(),
-            }
+            realtime_time_window(captured)
         } else {
             TimeWindow {
                 start: String::new(),
@@ -275,6 +265,28 @@ fn merge_table_stats(base: &mut Vec<TableStats>, extra: Vec<TableStats>) {
     }
 }
 
+fn realtime_time_window(captured: &CapturedPage) -> TimeWindow {
+    let parsed: Vec<DateTime<FixedOffset>> = captured
+        .requests
+        .iter()
+        .filter_map(|request| DateTime::parse_from_rfc3339(&request.timestamp).ok())
+        .collect();
+
+    if parsed.is_empty() {
+        return TimeWindow {
+            start: String::new(),
+            end: String::new(),
+        };
+    }
+
+    let min_ts = parsed.iter().min().cloned().unwrap();
+    let max_ts = parsed.iter().max().cloned().unwrap();
+    TimeWindow {
+        start: (min_ts - Duration::minutes(5)).to_rfc3339(),
+        end: (max_ts + Duration::minutes(5)).to_rfc3339(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +357,26 @@ mod tests {
         assert!(base
             .iter()
             .any(|s| s.schema == "outbound_platform" && s.row_count == 3));
+    }
+
+    #[test]
+    fn test_realtime_time_window_pads_captured_timestamps() {
+        let captured = CapturedPage {
+            page_url: "http://host/page".into(),
+            requests: vec![CapturedRequest {
+                method: "GET".into(),
+                url: "http://host/gateway/pcm-management/v1/list".into(),
+                status: 200,
+                duration_ms: 150,
+                trace_id: Some("trace-1".into()),
+                timestamp: "2026-06-03T12:00:00Z".into(),
+                request_type: "fetch".into(),
+                response_size: None,
+            }],
+        };
+
+        let window = realtime_time_window(&captured);
+        assert_eq!(window.start, "2026-06-03T11:55:00+00:00");
+        assert_eq!(window.end, "2026-06-03T12:05:00+00:00");
     }
 }

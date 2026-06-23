@@ -498,6 +498,112 @@ fn test_realtime_package_groups_logs_by_captured_request_trace_id() {
 }
 
 #[test]
+fn test_realtime_package_can_be_read_as_structured_package() {
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("realtime-readable-test.zip");
+    let (pkg, _) = mock_diagnosis_package();
+
+    build_realtime_package(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/gateway",
+        &zip_path,
+    )
+    .unwrap();
+
+    let loaded = read_package(&zip_path).expect("realtime package should be importable");
+    assert_eq!(loaded.manifest.collection_mode.as_deref(), Some("realtime"));
+    assert_eq!(loaded.captured_page.requests.len(), pkg.captured_page.requests.len());
+    assert_eq!(loaded.logs.len(), pkg.logs.len());
+    assert_eq!(loaded.sql_traces.len(), pkg.sql_traces.len());
+    assert_eq!(loaded.explain_plans.len(), pkg.explain_plans.len());
+    assert_eq!(loaded.table_stats.len(), pkg.table_stats.len());
+}
+
+#[test]
+fn test_realtime_package_masks_request_urls_in_markdown_and_structured_json() {
+    use std::io::Read;
+
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("realtime-masked-url-test.zip");
+    let (mut pkg, _) = mock_diagnosis_package();
+    pkg.captured_page.requests[0].url = "http://10.0.0.1/gateway/pcm-management/v1/patient/list?pageNum=1&pageSize=20&patientName=张三&phone=13800000000".into();
+
+    build_realtime_package(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/gateway",
+        &zip_path,
+    )
+    .unwrap();
+
+    let file = std::fs::File::open(&zip_path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+
+    let mut overview = String::new();
+    archive
+        .by_name("realtime/overview.md")
+        .unwrap()
+        .read_to_string(&mut overview)
+        .unwrap();
+    assert!(!overview.contains("张三"));
+    assert!(!overview.contains("13800000000"));
+
+    let mut request_logs = String::new();
+    archive
+        .by_name("realtime/request-logs.md")
+        .unwrap()
+        .read_to_string(&mut request_logs)
+        .unwrap();
+    assert!(request_logs.contains("pageNum=1"));
+    assert!(request_logs.contains("pageSize=20"));
+    assert!(!request_logs.contains("张三"));
+    assert!(!request_logs.contains("13800000000"));
+
+    drop(archive);
+    let loaded = read_package(&zip_path).unwrap();
+    let stored_url = &loaded.captured_page.requests[0].url;
+    assert!(stored_url.contains("pageNum=1"));
+    assert!(stored_url.contains("pageSize=20"));
+    assert!(!stored_url.contains("张三"));
+    assert!(!stored_url.contains("13800000000"));
+}
+
+#[test]
+fn test_realtime_package_masks_relative_request_urls() {
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("realtime-relative-masked-url-test.zip");
+    let (mut pkg, _) = mock_diagnosis_package();
+    pkg.captured_page.requests[0].url =
+        "/gateway/pcm-management/v1/patient/list?pageNum=1&pageSize=20&patientName=张三&phone=13800000000"
+            .into();
+
+    build_realtime_package(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/gateway",
+        &zip_path,
+    )
+    .unwrap();
+
+    let loaded = read_package(&zip_path).unwrap();
+    let stored_url = &loaded.captured_page.requests[0].url;
+    assert!(stored_url.contains("pageNum=1"));
+    assert!(stored_url.contains("pageSize=20"));
+    assert!(!stored_url.contains("张三"));
+    assert!(!stored_url.contains("13800000000"));
+}
+
+#[test]
 fn test_realtime_package_outputs_overview_index() {
     use std::io::Read;
 
@@ -530,6 +636,69 @@ fn test_realtime_package_outputs_overview_index() {
     assert!(overview.contains("| 1 | ERROR | `trace-abc123` | /v1/patient/list | 200 | 3500ms | pcm-management | ERROR=1 WARN=0 | 1 | 0 成功 / 0 失败 |"));
     assert!(overview.contains("| 2 | OK | `trace-def456` | /v1/user/info | 200 | 150ms | pcm-user | ERROR=0 WARN=0 | 0 | 0 成功 / 0 失败 |"));
     assert!(overview.contains("| 3 | ERROR | `无 traceId` | /v1/patient/update | 500 | 200ms | pcm-management | ERROR=0 WARN=0 | 0 | 0 成功 / 0 失败 |"));
+}
+
+#[test]
+fn test_realtime_overview_counts_explain_for_shared_sql_fingerprint() {
+    use std::io::Read;
+
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("realtime-shared-fingerprint-test.zip");
+    let (mut pkg, _) = mock_diagnosis_package();
+
+    pkg.sql_traces.push(SqlTrace {
+        trace_id: "trace-def456".into(),
+        service: "pcm-user".into(),
+        sql: pkg.sql_traces[0].sql.clone(),
+        sql_fingerprint: pkg.sql_traces[0].sql_fingerprint.clone(),
+        duration_ms: Some(1200.0),
+        tables: pkg.sql_traces[0].tables.clone(),
+        timestamp: Some("2026-06-03T12:00:02.000+08:00".into()),
+        parameters: Some("218713736305705076(String), ACTIVE(String)".into()),
+    });
+    pkg.explain_plans.push(ExplainPlan {
+        sql_fingerprint: pkg.sql_traces[0].sql_fingerprint.clone(),
+        avg_duration_ms: 1500.0,
+        source: "log_sql_explain".into(),
+        explain_rows: vec![ExplainRow {
+            id: Some(1),
+            select_type: Some("SIMPLE".into()),
+            table: Some("patient".into()),
+            access_type: Some("ref".into()),
+            possible_keys: Some("idx_org_status".into()),
+            key: Some("idx_org_status".into()),
+            rows: Some(10),
+            filtered: Some(100.0),
+            extra: Some("Using where".into()),
+        }],
+        table_stats: None,
+        trace_id: Some("trace-abc123".into()),
+        executed_sql: Some("SELECT id, name, org_id FROM patient WHERE org_id = '1' AND status = 'ACTIVE' ORDER BY create_time DESC".into()),
+        error: None,
+        found_in_schema: Some("pcm_db".into()),
+    });
+
+    build_realtime_package(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/gateway",
+        &zip_path,
+    )
+    .unwrap();
+
+    let file = std::fs::File::open(&zip_path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut overview = String::new();
+    archive
+        .by_name("realtime/overview.md")
+        .unwrap()
+        .read_to_string(&mut overview)
+        .unwrap();
+
+    assert!(overview.contains("| 2 | SLOW | `trace-def456` | /v1/user/info | 200 | 150ms | pcm-user | ERROR=0 WARN=0 | 1 | 1 成功 / 0 失败 |"));
 }
 
 #[test]
