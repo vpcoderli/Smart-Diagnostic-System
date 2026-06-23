@@ -149,11 +149,17 @@ impl DiagnosisRunner {
 
         // Step 6: 准备打包
         let now = Utc::now();
+        let manifest_window =
+            if self.captured.is_none() && window.start.is_empty() && window.end.is_empty() {
+                log_time_window(&all_logs)
+            } else {
+                window.clone()
+            };
         let manifest = diagnosis_manifest(
             self,
             &now,
             self.captured.as_ref(),
-            &window,
+            &manifest_window,
             &trace_ids,
             &all_logs,
             &sql_traces,
@@ -433,6 +439,28 @@ fn realtime_time_window(captured: &CapturedPage) -> TimeWindow {
     }
 }
 
+fn log_time_window(logs: &[LogEntry]) -> TimeWindow {
+    let parsed: Vec<DateTime<FixedOffset>> = logs
+        .iter()
+        .filter_map(|entry| entry.time.as_deref())
+        .filter_map(|time| DateTime::parse_from_rfc3339(time).ok())
+        .collect();
+
+    if parsed.is_empty() {
+        return TimeWindow {
+            start: String::new(),
+            end: String::new(),
+        };
+    }
+
+    let min_ts = parsed.iter().min().cloned().unwrap();
+    let max_ts = parsed.iter().max().cloned().unwrap();
+    TimeWindow {
+        start: (min_ts - Duration::minutes(5)).to_rfc3339(),
+        end: (max_ts + Duration::minutes(5)).to_rfc3339(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,6 +723,27 @@ mod tests {
         let window = realtime_time_window(&captured);
         assert_eq!(window.start, "2026-06-03T11:55:00+00:00");
         assert_eq!(window.end, "2026-06-03T12:05:00+00:00");
+    }
+
+    #[test]
+    fn test_log_time_window_pads_log_timestamps() {
+        let logs = vec![LogEntry {
+            time: Some("2026-06-23T10:00:00+08:00".into()),
+            level: "INFO".into(),
+            service: "pcm-management".into(),
+            trace_id: Some("trace-1".into()),
+            thread: None,
+            class: None,
+            method: None,
+            message: "ok".into(),
+            exception: None,
+            stack_trace: None,
+            raw: "raw".into(),
+        }];
+
+        let window = log_time_window(&logs);
+        assert_eq!(window.start, "2026-06-23T09:55:00+08:00");
+        assert_eq!(window.end, "2026-06-23T10:05:00+08:00");
     }
 
     #[test]
