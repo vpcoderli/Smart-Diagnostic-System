@@ -86,8 +86,10 @@ impl LogCollector for SshLogCollector {
                             }
                         }
                         Err(e) => {
-                            let msg =
-                                format!("SSH 采集 {}:{} traceId={} 失败: {}", svc.name, host, trace_id, e);
+                            let msg = format!(
+                                "SSH 采集 {}:{} traceId={} 失败: {}",
+                                svc.name, host, trace_id, e
+                            );
                             tracing::warn!("{}", msg);
                             self.record_warning(msg);
                         }
@@ -138,8 +140,10 @@ impl LogCollector for SshLogCollector {
                             }
                         }
                         Err(e) => {
-                            let msg =
-                                format!("SSH 关键字采集 {}:{} 关键词={} 失败: {}", svc.name, host, keyword, e);
+                            let msg = format!(
+                                "SSH 关键字采集 {}:{} 关键词={} 失败: {}",
+                                svc.name, host, keyword, e
+                            );
                             tracing::warn!("{}", msg);
                             self.record_warning(msg);
                         }
@@ -193,9 +197,11 @@ fn entry_in_window(
     start: DateTime<FixedOffset>,
     end: DateTime<FixedOffset>,
 ) -> bool {
-    match entry.time.as_deref().and_then(|time| {
-        parse_entry_timestamp(time, *start.offset())
-    }) {
+    match entry
+        .time
+        .as_deref()
+        .and_then(|time| parse_entry_timestamp(time, *start.offset()))
+    {
         Some(timestamp) => timestamp >= start && timestamp <= end,
         None => true,
     }
@@ -253,7 +259,10 @@ mod tests {
         let filtered = filter_entries_by_window(entries, &window);
 
         assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0].time.as_deref(), Some("2026-06-03T12:00:00+00:00"));
+        assert_eq!(
+            filtered[0].time.as_deref(),
+            Some("2026-06-03T12:00:00+00:00")
+        );
         assert_eq!(filtered[1].time, None);
     }
 

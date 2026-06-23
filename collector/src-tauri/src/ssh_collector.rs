@@ -45,7 +45,9 @@ pub async fn ssh_exec(host: &str, config: &SshConfig, command: &str) -> Result<S
     if !auth_result {
         return Err(anyhow!(
             "SSH 认证失败: 用户 {} 在 {} 上认证被拒绝 (方式: {})",
-            config.username, host, config.auth_type
+            config.username,
+            host,
+            config.auth_type
         ));
     }
 
@@ -156,10 +158,7 @@ pub async fn list_remote_logs(
         format!("{}/", log_dir)
     };
 
-    let cmd = format!(
-        "ls -lht {}{} 2>/dev/null | head -20",
-        dir, log_pattern
-    );
+    let cmd = format!("ls -lht {}{} 2>/dev/null | head -20", dir, log_pattern);
 
     let output = ssh_exec(host, ssh_config, &cmd).await?;
     Ok(output.lines().map(String::from).collect())

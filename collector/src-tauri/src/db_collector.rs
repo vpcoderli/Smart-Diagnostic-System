@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use diag_core::config::DatabaseConfig;
-use diag_core::models::{ExplainSummary, SlowSqlItem, TableStats, IndexInfo};
+use diag_core::models::{IndexInfo, SlowSqlItem, TableStats};
 use diag_core::sql_parser;
 
 /// 数据库采集器
@@ -22,6 +22,25 @@ impl DbCollector {
         }
     }
 
+    /// 针对日志 SQL 涉及的表名补采表统计，避免只取 Top N 表导致报告显示为空。
+    pub async fn collect_table_stats_for_tables(
+        &self,
+        table_names: &[String],
+    ) -> Result<Vec<TableStats>> {
+        let mut unique = table_names.to_vec();
+        unique.sort();
+        unique.dedup();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        match self.config.db_type.as_str() {
+            "mysql" => self.collect_mysql_table_stats_for_tables(&unique).await,
+            "postgresql" | "postgres" => self.collect_pg_table_stats_for_tables(&unique).await,
+            other => Err(anyhow!("不支持的数据库类型: {}", other)),
+        }
+    }
+
     // ─── MySQL ───
 
     async fn collect_mysql(&self) -> Result<(Vec<SlowSqlItem>, Vec<TableStats>)> {
@@ -34,9 +53,14 @@ impl DbCollector {
             self.config.database
         );
 
-        let pool = sqlx::MySqlPool::connect(&url)
-            .await
-            .map_err(|e| anyhow!("MySQL 连接失败 ({}:{}): {}", self.config.host, self.config.port, e))?;
+        let pool = sqlx::MySqlPool::connect(&url).await.map_err(|e| {
+            anyhow!(
+                "MySQL 连接失败 ({}:{}): {}",
+                self.config.host,
+                self.config.port,
+                e
+            )
+        })?;
 
         tracing::info!("MySQL 连接成功: {}:{}", self.config.host, self.config.port);
 
@@ -136,6 +160,67 @@ impl DbCollector {
         Ok(stats)
     }
 
+    async fn collect_mysql_table_stats_for_tables(
+        &self,
+        table_names: &[String],
+    ) -> Result<Vec<TableStats>> {
+        let url = format!(
+            "mysql://{}:{}@{}:{}/{}",
+            self.config.username,
+            self.config.password,
+            self.config.host,
+            self.config.port,
+            self.config.database
+        );
+        let pool = sqlx::MySqlPool::connect(&url).await.map_err(|e| {
+            anyhow!(
+                "MySQL 连接失败 ({}:{}): {}",
+                self.config.host,
+                self.config.port,
+                e
+            )
+        })?;
+
+        let mut stats = Vec::new();
+        for table_name in table_names {
+            let rows: Vec<MysqlTableRow> = sqlx::query_as(
+                r#"SELECT
+                     TABLE_SCHEMA as table_schema,
+                     TABLE_NAME as table_name,
+                     TABLE_ROWS as table_rows,
+                     DATA_LENGTH as data_length,
+                     INDEX_LENGTH as index_length
+                   FROM information_schema.tables
+                   WHERE TABLE_SCHEMA = ?
+                     AND TABLE_NAME = ?
+                     AND TABLE_TYPE = 'BASE TABLE'"#,
+            )
+            .bind(&self.config.database)
+            .bind(table_name)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| anyhow!("查询指定表 stats 失败: {}", e))?;
+
+            for row in rows {
+                let indexes = self
+                    .query_mysql_indexes(&pool, &row.table_name)
+                    .await
+                    .unwrap_or_default();
+                stats.push(TableStats {
+                    schema: row.table_schema,
+                    table_name: row.table_name,
+                    row_count: row.table_rows.unwrap_or(0),
+                    data_size_bytes: row.data_length,
+                    index_size_bytes: row.index_length,
+                    indexes,
+                });
+            }
+        }
+
+        pool.close().await;
+        Ok(stats)
+    }
+
     async fn query_mysql_indexes(
         &self,
         pool: &sqlx::MySqlPool,
@@ -189,11 +274,39 @@ impl DbCollector {
             self.config.database
         );
 
-        let pool = sqlx::PgPool::connect(&url)
-            .await
-            .map_err(|e| anyhow!("PostgreSQL 连接失败 ({}:{}): {}", self.config.host, self.config.port, e))?;
+        let pool = sqlx::PgPool::connect(&url).await.map_err(|e| {
+            anyhow!(
+                "PostgreSQL 连接失败 ({}:{}): {}",
+                self.config.host,
+                self.config.port,
+                e
+            )
+        })?;
 
-        tracing::info!("PostgreSQL 连接成功: {}:{}", self.config.host, self.config.port);
+        tracing::info!(
+            "PostgreSQL 连接成功: {}:{}",
+            self.config.host,
+            self.config.port
+        );
+
+        // SET search_path（如果指定了 schemas）
+        if !self.config.schemas.is_empty() {
+            let mut parts: Vec<String> = self
+                .config
+                .schemas
+                .iter()
+                .map(|s| quote_pg_ident(s))
+                .collect();
+            if !self.config.schemas.iter().any(|s| s == "public") {
+                parts.push("public".to_string());
+            }
+            let sql = format!("SET search_path TO {}", parts.join(", "));
+            sqlx::query(&sql)
+                .execute(&pool)
+                .await
+                .map_err(|e| anyhow!("SET search_path 失败: {}", e))?;
+            tracing::info!("{}", sql);
+        }
 
         let slow_sqls = self.query_pg_slow_sql(&pool).await?;
         let table_stats = self.query_pg_table_stats(&pool).await?;
@@ -252,18 +365,36 @@ impl DbCollector {
     }
 
     async fn query_pg_table_stats(&self, pool: &sqlx::PgPool) -> Result<Vec<TableStats>> {
-        let rows: Vec<PgTableRow> = sqlx::query_as(
-            r#"SELECT
-                 schemaname,
-                 relname as table_name,
-                 n_live_tup as row_count,
-                 pg_total_relation_size(relid) as total_size
-               FROM pg_stat_user_tables
-               ORDER BY n_live_tup DESC
-               LIMIT 50"#,
-        )
-        .fetch_all(pool)
-        .await
+        // 如果配置了 schemas，则只采集这些 schema 下的表
+        let rows: Vec<PgTableRow> = if !self.config.schemas.is_empty() {
+            sqlx::query_as(
+                r#"SELECT
+                     schemaname,
+                     relname as table_name,
+                     n_live_tup as row_count,
+                     pg_total_relation_size(relid) as total_size
+                   FROM pg_stat_user_tables
+                   WHERE schemaname = ANY($1)
+                   ORDER BY n_live_tup DESC
+                   LIMIT 50"#,
+            )
+            .bind(&self.config.schemas)
+            .fetch_all(pool)
+            .await
+        } else {
+            sqlx::query_as(
+                r#"SELECT
+                     schemaname,
+                     relname as table_name,
+                     n_live_tup as row_count,
+                     pg_total_relation_size(relid) as total_size
+                   FROM pg_stat_user_tables
+                   ORDER BY n_live_tup DESC
+                   LIMIT 50"#,
+            )
+            .fetch_all(pool)
+            .await
+        }
         .map_err(|e| anyhow!("查询 pg_stat_user_tables 失败: {}", e))?;
 
         let mut stats = Vec::new();
@@ -287,21 +418,90 @@ impl DbCollector {
         Ok(stats)
     }
 
+    async fn collect_pg_table_stats_for_tables(
+        &self,
+        table_names: &[String],
+    ) -> Result<Vec<TableStats>> {
+        let url = format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.config.username,
+            self.config.password,
+            self.config.host,
+            self.config.port,
+            self.config.database
+        );
+        let pool = sqlx::PgPool::connect(&url).await.map_err(|e| {
+            anyhow!(
+                "PostgreSQL 连接失败 ({}:{}): {}",
+                self.config.host,
+                self.config.port,
+                e
+            )
+        })?;
+
+        let rows: Vec<PgTableRow> = sqlx::query_as(
+            r#"SELECT
+                 schemaname,
+                 relname as table_name,
+                 n_live_tup as row_count,
+                 pg_total_relation_size(relid) as total_size
+               FROM pg_stat_user_tables
+               WHERE relname = ANY($1)
+               ORDER BY schemaname, relname"#,
+        )
+        .bind(table_names)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| anyhow!("查询指定 PG 表统计失败: {}", e))?;
+
+        let mut stats = Vec::new();
+        for row in rows {
+            let indexes = query_pg_indexes_for_schema(&pool, &row.schemaname, &row.table_name)
+                .await
+                .unwrap_or_default();
+            stats.push(TableStats {
+                schema: row.schemaname,
+                table_name: row.table_name,
+                row_count: row.row_count,
+                data_size_bytes: Some(row.total_size),
+                index_size_bytes: None,
+                indexes,
+            });
+        }
+
+        pool.close().await;
+        Ok(stats)
+    }
+
     async fn query_pg_indexes(
         &self,
         pool: &sqlx::PgPool,
         table_name: &str,
     ) -> Result<Vec<IndexInfo>> {
-        let rows: Vec<PgIndexRow> = sqlx::query_as(
-            r#"SELECT
-                 indexname,
-                 indexdef
-               FROM pg_indexes
-               WHERE tablename = $1"#,
-        )
-        .bind(table_name)
-        .fetch_all(pool)
-        .await?;
+        let rows: Vec<PgIndexRow> = if !self.config.schemas.is_empty() {
+            sqlx::query_as(
+                r#"SELECT
+                     indexname,
+                     indexdef
+                   FROM pg_indexes
+                   WHERE tablename = $1 AND schemaname = ANY($2)"#,
+            )
+            .bind(table_name)
+            .bind(&self.config.schemas)
+            .fetch_all(pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                r#"SELECT
+                     indexname,
+                     indexdef
+                   FROM pg_indexes
+                   WHERE tablename = $1"#,
+            )
+            .bind(table_name)
+            .fetch_all(pool)
+            .await?
+        };
 
         Ok(rows
             .into_iter()
@@ -317,6 +517,37 @@ impl DbCollector {
             })
             .collect())
     }
+}
+
+async fn query_pg_indexes_for_schema(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    table_name: &str,
+) -> Result<Vec<IndexInfo>> {
+    let rows: Vec<PgIndexRow> = sqlx::query_as(
+        r#"SELECT
+             indexname,
+             indexdef
+           FROM pg_indexes
+           WHERE schemaname = $1 AND tablename = $2"#,
+    )
+    .bind(schema)
+    .bind(table_name)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let unique = row.indexdef.to_uppercase().contains("UNIQUE");
+            let columns = extract_columns_from_indexdef(&row.indexdef);
+            IndexInfo {
+                name: row.indexname,
+                columns,
+                unique,
+            }
+        })
+        .collect())
 }
 
 // ─── SQL 行映射结构体 ───
@@ -374,11 +605,26 @@ fn extract_columns_from_indexdef(indexdef: &str) -> Vec<String> {
     if let Some(start) = indexdef.rfind('(') {
         if let Some(end) = indexdef.rfind(')') {
             let cols = &indexdef[start + 1..end];
-            return cols
-                .split(',')
-                .map(|c| c.trim().to_string())
-                .collect();
+            return cols.split(',').map(|c| c.trim().to_string()).collect();
         }
     }
     vec![]
+}
+
+/// 安全引用 PG 标识符（schema 名）
+fn quote_pg_ident(name: &str) -> String {
+    let is_safe = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_lowercase() || c == '_')
+            .unwrap_or(false)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if is_safe {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
 }
