@@ -1079,22 +1079,28 @@ fn render_request_explain_plans(plans: &[&ExplainPlan]) -> String {
 }
 
 fn render_request_evidence_links(logs: &[&LogEntry], sql_traces: &[&SqlTrace]) -> String {
-    let mut services: Vec<&str> = logs
+    let mut log_services: Vec<&str> = logs.iter().map(|entry| entry.service.as_str()).collect();
+    log_services.sort_unstable();
+    log_services.dedup();
+
+    let mut sql_services: Vec<&str> = sql_traces
         .iter()
-        .map(|entry| entry.service.as_str())
-        .chain(sql_traces.iter().map(|trace| trace.service.as_str()))
+        .map(|trace| trace.service.as_str())
         .collect();
-    services.sort_unstable();
-    services.dedup();
+    sql_services.sort_unstable();
+    sql_services.dedup();
 
     let mut md = String::new();
     md.push_str("### 完整证据\n\n");
-    if services.is_empty() {
-        md.push_str("- 未关联到服务级原始日志\n\n");
+    if log_services.is_empty() && sql_services.is_empty() {
+        md.push_str("- 未关联到服务级原始证据\n\n");
         return md;
     }
-    for service in services {
+
+    for service in log_services {
         md.push_str(&format!("- 完整服务日志：`{}.txt`\n", service));
+    }
+    for service in sql_services {
         md.push_str(&format!("- 服务 SQL 报告：`{}_sql.md`\n", service));
     }
     md.push('\n');

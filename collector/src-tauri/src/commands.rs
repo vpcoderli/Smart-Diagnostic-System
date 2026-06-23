@@ -669,6 +669,23 @@ fn build_elk_config_from_manifest(
     })
 }
 
+fn has_ssh_fallback_config(config: &CollectorConfig) -> bool {
+    !config.services.is_empty()
+        && !config.ssh.username.trim().is_empty()
+        && (config
+            .ssh
+            .password
+            .as_deref()
+            .map(|password| !password.trim().is_empty())
+            .unwrap_or(false)
+            || config
+                .ssh
+                .private_key
+                .as_deref()
+                .map(|private_key| !private_key.trim().is_empty())
+                .unwrap_or(false))
+}
+
 /// 启动完整诊断流程（实时模式）
 #[tauri::command]
 pub async fn start_diagnosis(
@@ -733,20 +750,26 @@ pub async fn start_diagnosis(
                     Box::new(elk)
                 }
                 Err(e) => {
-                    tracing::warn!("ELK 不可用 ({}), 降级 SSH", e);
-                    Box::new(SshLogCollector::new(
-                        config.ssh.clone(),
-                        config.services.clone(),
-                        config.collector.max_log_lines,
-                    ))
+                    if has_ssh_fallback_config(&config) {
+                        tracing::warn!("ELK 不可用 ({}), 降级 SSH", e);
+                        Box::new(SshLogCollector::new(
+                            config.ssh.clone(),
+                            config.services.clone(),
+                            config.collector.max_log_lines,
+                        ))
+                    } else {
+                        return Err(format!("ELK 初始化失败，且未配置可用 SSH 降级: {}", e));
+                    }
                 }
             }
-        } else {
+        } else if has_ssh_fallback_config(&config) {
             Box::new(SshLogCollector::new(
                 config.ssh.clone(),
                 config.services.clone(),
                 config.collector.max_log_lines,
             ))
+        } else {
+            return Err("未配置 ELK，且未配置可用 SSH 日志采集".to_string());
         };
 
     let runner = DiagnosisRunner::new(config, captured, log_collector);
@@ -2036,5 +2059,33 @@ mod tests {
             runner.historical_window().map(|w| (&w.start, &w.end)),
             Some((&window.start, &window.end))
         );
+    }
+
+    #[test]
+    fn test_has_ssh_fallback_config_requires_services_and_credentials() {
+        let mut config = mock_collector_config();
+        assert!(has_ssh_fallback_config(&config));
+
+        config.services.clear();
+        assert!(!has_ssh_fallback_config(&config));
+
+        let mut config = mock_collector_config();
+        config.ssh.username = "   ".into();
+        assert!(!has_ssh_fallback_config(&config));
+
+        let mut config = mock_collector_config();
+        config.ssh.password = None;
+        config.ssh.private_key = None;
+        assert!(!has_ssh_fallback_config(&config));
+
+        let mut config = mock_collector_config();
+        config.ssh.password = Some("   ".into());
+        config.ssh.private_key = Some("   ".into());
+        assert!(!has_ssh_fallback_config(&config));
+
+        let mut config = mock_collector_config();
+        config.ssh.password = None;
+        config.ssh.private_key = Some("/Users/test/.ssh/id_rsa".into());
+        assert!(has_ssh_fallback_config(&config));
     }
 }

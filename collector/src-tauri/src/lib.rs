@@ -1,11 +1,39 @@
+mod cleanup;
 mod commands;
+mod config_store;
 mod db_collector;
+mod dedup_cache;
 mod deployment;
 mod diagnosis;
+mod elk_collector;
+mod explain_collector;
+mod nacos_discovery;
+mod scheduler;
+mod sql_extractor;
 mod ssh_collector;
+mod ssh_log_collector;
 mod validator;
+mod webview_capture;
 
 use commands::*;
+use std::sync::Mutex;
+use webview_capture::CapturedDataStore;
+
+fn decode_diag_collect_payload(body: &[u8]) -> String {
+    let payload = String::from_utf8_lossy(body).into_owned();
+    let trimmed = payload.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return payload;
+    }
+
+    if let Some((_, value)) =
+        url::form_urlencoded::parse(payload.as_bytes()).find(|(key, _)| key == "data")
+    {
+        return value.into_owned();
+    }
+
+    payload
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -15,11 +43,92 @@ pub fn run() {
 
     tracing::info!("Smart Diagnostic Collector 启动中...");
 
+    // 捕获数据存储 — 诊断窗口通过 custom protocol 将数据写入此处
+    let captured_store = std::sync::Arc::new(CapturedDataStore::default());
+    let captured_store_for_protocol = captured_store.clone();
+
+    // 请求计数存储 — 实时更新前端请求计数
+    let request_count: std::sync::Arc<Mutex<usize>> = std::sync::Arc::new(Mutex::new(0));
+    let count_for_protocol = request_count.clone();
+
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            manifest: std::sync::Mutex::new(None),
-            config: std::sync::Mutex::new(None),
-            validated: std::sync::Mutex::new(false),
+            manifest: Mutex::new(None),
+            config: Mutex::new(None),
+            validated: Mutex::new(false),
+            scheduler_status: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::scheduler::SchedulerStatus::default(),
+            )),
+            scheduler_handle: Mutex::new(None),
+        })
+        .manage(captured_store)
+        .manage(request_count)
+        // ── setup 钩子：应用初始化后用正确的 app_data_dir 加载已保存配置 ──
+        .setup(|app| {
+            use tauri::Manager;
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                match crate::config_store::load_config(&data_dir) {
+                    Ok(manifest) => {
+                        tracing::info!("启动时加载已保存配置: 站点={}", manifest.site_name);
+                        let config = crate::deployment::manifest_to_collector_config(&manifest);
+                        let state = app.state::<AppState>();
+                        *state.manifest.lock().unwrap() = Some(manifest);
+                        *state.config.lock().unwrap() = Some(config);
+                        // validated 仍为 false，每次启动需重新校验
+                    }
+                    Err(e) => {
+                        tracing::debug!("无已保存配置（首次启动或已清空）: {}", e);
+                    }
+                }
+            }
+            Ok(())
+        })
+        // ═══ custom protocol: 诊断窗口 → Rust 数据通道 ═══
+        .register_asynchronous_uri_scheme_protocol("diag", move |_ctx, request, responder| {
+            let uri = request.uri().to_string();
+            let body = request.body().to_vec();
+
+            tracing::debug!("diag:// 协议收到请求: uri={}, body_len={}", uri, body.len());
+
+            if uri.contains("collect") {
+                let data = decode_diag_collect_payload(&body);
+                if !data.is_empty() {
+                    tracing::info!("收到诊断数据: {} bytes", data.len());
+                    *captured_store_for_protocol.data.lock().unwrap() = Some(data);
+                }
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                    .header("Access-Control-Allow-Headers", "Content-Type")
+                    .body(b"ok".to_vec())
+                    .unwrap();
+                responder.respond(response);
+            } else if uri.contains("count") {
+                let count_str = String::from_utf8(body).unwrap_or_default();
+                if let Ok(count) = count_str.trim().parse::<usize>() {
+                    tracing::info!("diag://count 更新计数: {}", count);
+                    *count_for_protocol.lock().unwrap() = count;
+                }
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                    .header("Access-Control-Allow-Headers", "Content-Type")
+                    .body(b"ok".to_vec())
+                    .unwrap();
+                responder.respond(response);
+            } else {
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                    .header("Access-Control-Allow-Headers", "Content-Type")
+                    .body(b"ok".to_vec())
+                    .unwrap();
+                responder.respond(response);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // 第一步：部署文档导入
@@ -33,12 +142,64 @@ pub fn run() {
             validate_services,
             validate_single_service,
             validate_databases,
+            list_available_databases,
+            list_available_schemas,
+            list_available_tables,
+            set_selected_database,
+            set_selected_schemas,
             confirm_validation,
-            // 第三步：采集
+            // 第三步：WebView 采集
+            open_diag_browser,
+            collect_diag_data,
+            get_capture_count,
+            reset_capture_data,
+            close_diag_browser,
             resolve_request_url,
             start_diagnosis,
             get_config_summary,
+            get_desktop_path,
+            pick_output_folder,
+            // ELK 相关
+            set_elk_config,
+            test_elk_connection,
+            set_schedule_config,
+            // 调度器
+            start_scheduler,
+            stop_scheduler,
+            get_scheduler_status,
+            start_historical_diagnosis,
+            // 配置持久化
+            save_config_to_disk,
+            load_config_from_disk,
+            clear_saved_config,
+            // 快速诊断
+            start_quick_diagnosis,
+            open_output_dir,
         ])
         .run(tauri::generate_context!())
         .expect("收集端启动失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_diag_collect_payload_keeps_raw_json() {
+        let payload = br#"{"pageUrl":"http://host","requests":[]}"#;
+        assert_eq!(
+            decode_diag_collect_payload(payload),
+            r#"{"pageUrl":"http://host","requests":[]}"#
+        );
+    }
+
+    #[test]
+    fn test_decode_diag_collect_payload_extracts_form_data() {
+        let payload =
+            b"data=%7B%22pageUrl%22%3A%22http%3A%2F%2Fhost%22%2C%22requests%22%3A%5B%5D%7D";
+        assert_eq!(
+            decode_diag_collect_payload(payload),
+            r#"{"pageUrl":"http://host","requests":[]}"#
+        );
+    }
 }

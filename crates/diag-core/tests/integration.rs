@@ -1099,6 +1099,54 @@ fn test_realtime_request_cards_use_trace_specific_sql_for_shared_fingerprint() {
 }
 
 #[test]
+fn test_realtime_request_cards_only_link_existing_artifacts() {
+    use std::io::Read;
+
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("evidence-links-test.zip");
+    let (mut pkg, _) = mock_diagnosis_package();
+    pkg.logs
+        .retain(|log| log.trace_id.as_deref() == Some("trace-abc123"));
+    pkg.sql_traces = vec![SqlTrace {
+        trace_id: "trace-def456".into(),
+        service: "pcm-user".into(),
+        sql: "select * from user where id = ?".into(),
+        sql_fingerprint: "select * from user where id = ?".into(),
+        duration_ms: None,
+        tables: vec!["user".into()],
+        timestamp: Some("2026-06-03T12:00:02+08:00".into()),
+        parameters: Some("1(Integer)".into()),
+    }];
+
+    build_realtime_package(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/gateway",
+        &zip_path,
+    )
+    .unwrap();
+
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+    let mut cards = String::new();
+    archive
+        .by_name("realtime/request-cards.md")
+        .unwrap()
+        .read_to_string(&mut cards)
+        .unwrap();
+
+    let first_card = cards.split("## 2.").next().unwrap();
+    assert!(first_card.contains("完整服务日志：`pcm-management.txt`"));
+    assert!(!first_card.contains("服务 SQL 报告：`pcm-management_sql.md`"));
+
+    let second_card = cards.split("## 2.").nth(1).unwrap();
+    assert!(!second_card.contains("完整服务日志：`pcm-user.txt`"));
+    assert!(second_card.contains("服务 SQL 报告：`pcm-user_sql.md`"));
+}
+
+#[test]
 fn test_realtime_request_report_treats_timestamp_as_end_time() {
     use std::io::Read;
 
