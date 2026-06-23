@@ -624,7 +624,7 @@ fn test_realtime_package_masks_relative_request_urls() {
 fn test_realtime_package_with_manifest_preserves_metadata_and_collection_report() {
     let dir = tempdir().unwrap();
     let zip_path = dir.path().join("realtime-manifest-report-test.zip");
-    let (mut pkg, _) = mock_diagnosis_package();
+    let (mut pkg, masking) = mock_diagnosis_package();
     let privacy = mock_collector_config().privacy;
     pkg.manifest.diagnosis_id = "diag-real-001".into();
     pkg.manifest.site = "real-hospital".into();
@@ -649,6 +649,7 @@ fn test_realtime_package_with_manifest_preserves_metadata_and_collection_report(
     build_realtime_package_with_manifest(
         &pkg.logs,
         &pkg.sql_traces,
+        &pkg.slow_sqls,
         &pkg.explain_plans,
         &pkg.table_stats,
         &pkg.captured_page,
@@ -656,6 +657,7 @@ fn test_realtime_package_with_manifest_preserves_metadata_and_collection_report(
         &pkg.manifest,
         Some(&report),
         &privacy,
+        Some(&masking),
         &zip_path,
     )
     .unwrap();
@@ -708,6 +710,7 @@ fn test_realtime_package_with_manifest_uses_supplied_privacy_config() {
     build_realtime_package_with_manifest(
         &pkg.logs,
         &pkg.sql_traces,
+        &pkg.slow_sqls,
         &pkg.explain_plans,
         &pkg.table_stats,
         &pkg.captured_page,
@@ -715,6 +718,7 @@ fn test_realtime_package_with_manifest_uses_supplied_privacy_config() {
         &pkg.manifest,
         None,
         &privacy,
+        None,
         &zip_path,
     )
     .unwrap();
@@ -737,6 +741,78 @@ fn test_realtime_package_with_manifest_uses_supplied_privacy_config() {
     assert!(!loaded.manifest.page_url.contains("赵六"));
     assert!(loaded.captured_page.requests[0].url.contains("pageNum=1"));
     assert!(!loaded.captured_page.requests[0].url.contains("status=OPEN"));
+}
+
+#[test]
+fn test_realtime_package_with_manifest_preserves_slow_sqls() {
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("realtime-slow-sql-test.zip");
+    let (pkg, masking) = mock_diagnosis_package();
+    let report = pkg.collection_report.clone();
+
+    diag_core::package::build_realtime_package_with_manifest(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.slow_sqls,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.captured_page,
+        "/gateway",
+        &pkg.manifest,
+        report.as_ref(),
+        &PrivacyConfig {
+            mask_query_values: true,
+            allowed_query_keys: vec!["pageNum".into(), "pageSize".into()],
+        },
+        Some(&masking),
+        &zip_path,
+    )
+    .unwrap();
+
+    let loaded = read_package(&zip_path).unwrap();
+    assert_eq!(loaded.slow_sqls.len(), pkg.slow_sqls.len());
+    assert_eq!(
+        loaded.slow_sqls[0].sql_fingerprint,
+        pkg.slow_sqls[0].sql_fingerprint
+    );
+}
+
+#[test]
+fn test_quick_package_with_manifest_writes_slow_sqls_and_masking_report() {
+    use std::io::Read;
+
+    let dir = tempdir().unwrap();
+    let zip_path = dir.path().join("quick-slow-sql-masking-test.zip");
+    let (pkg, masking) = mock_diagnosis_package();
+
+    diag_core::package::build_quick_package_with_manifest(
+        &pkg.logs,
+        &pkg.sql_traces,
+        &pkg.slow_sqls,
+        &pkg.explain_plans,
+        &pkg.table_stats,
+        &pkg.manifest,
+        pkg.collection_report.as_ref(),
+        Some(&masking),
+        &zip_path,
+    )
+    .unwrap();
+
+    let loaded = read_package(&zip_path).unwrap();
+    assert_eq!(loaded.slow_sqls.len(), pkg.slow_sqls.len());
+
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+    let mut masking_json = String::new();
+    archive
+        .by_name("privacy/masking-report.json")
+        .expect("masking report should be written")
+        .read_to_string(&mut masking_json)
+        .unwrap();
+    let loaded_masking: MaskingReport = serde_json::from_str(&masking_json).unwrap();
+    assert_eq!(
+        loaded_masking.total_items_masked,
+        masking.total_items_masked
+    );
 }
 
 #[test]
@@ -766,10 +842,12 @@ fn test_quick_package_with_manifest_preserves_historical_mode_and_report() {
     build_quick_package_with_manifest(
         &pkg.logs,
         &pkg.sql_traces,
+        &pkg.slow_sqls,
         &pkg.explain_plans,
         &pkg.table_stats,
         &pkg.manifest,
         Some(&report),
+        None,
         &zip_path,
     )
     .unwrap();

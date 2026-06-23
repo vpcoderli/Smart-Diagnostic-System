@@ -174,6 +174,7 @@ impl DiagnosisRunner {
             &skipped_services,
             &collection_errors,
         );
+        let masking_report = url_masking_report(self.captured.as_ref(), &self.config.privacy);
 
         // Step 8: 打包（统一使用 TXT 格式，与快速诊断一致）
         let filename = format!(
@@ -192,6 +193,7 @@ impl DiagnosisRunner {
             diag_core::package::build_realtime_package_with_manifest(
                 &all_logs,
                 &sql_traces,
+                &slow_sqls,
                 &explain_plans,
                 &table_stats,
                 captured,
@@ -199,16 +201,19 @@ impl DiagnosisRunner {
                 &manifest,
                 Some(&report),
                 &self.config.privacy,
+                Some(&masking_report),
                 &output_path,
             )?;
         } else {
             diag_core::package::build_quick_package_with_manifest(
                 &all_logs,
                 &sql_traces,
+                &slow_sqls,
                 &explain_plans,
                 &table_stats,
                 &manifest,
                 Some(&report),
+                Some(&masking_report),
                 &output_path,
             )?;
         }
@@ -420,6 +425,90 @@ fn merge_table_stats(base: &mut Vec<TableStats>, extra: Vec<TableStats>) {
         if seen.insert(key) {
             base.push(stat);
         }
+    }
+}
+
+fn url_masking_report(
+    captured: Option<&CapturedPage>,
+    privacy: &diag_core::config::PrivacyConfig,
+) -> MaskingReport {
+    let Some(captured) = captured else {
+        return MaskingReport {
+            masked_query_params: Vec::new(),
+            removed_headers: Vec::new(),
+            masked_sql_params: false,
+            total_items_masked: 0,
+        };
+    };
+
+    if !privacy.mask_query_values {
+        return MaskingReport {
+            masked_query_params: Vec::new(),
+            removed_headers: Vec::new(),
+            masked_sql_params: false,
+            total_items_masked: 0,
+        };
+    }
+
+    let allowed_keys: HashSet<&str> = privacy
+        .allowed_query_keys
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut masked_keys: HashSet<String> = HashSet::new();
+    let mut total_items_masked = 0;
+
+    if let Ok(page_url) = url::Url::parse(&captured.page_url) {
+        collect_masked_query_params(
+            &page_url,
+            &allowed_keys,
+            &mut masked_keys,
+            &mut total_items_masked,
+        );
+    }
+
+    for request in &captured.requests {
+        if let Some(request_url) = parse_url_for_masking_report(&request.url, &captured.page_url) {
+            collect_masked_query_params(
+                &request_url,
+                &allowed_keys,
+                &mut masked_keys,
+                &mut total_items_masked,
+            );
+        }
+    }
+
+    let mut masked_query_params: Vec<String> = masked_keys.into_iter().collect();
+    masked_query_params.sort();
+
+    MaskingReport {
+        masked_query_params,
+        removed_headers: Vec::new(),
+        masked_sql_params: false,
+        total_items_masked,
+    }
+}
+
+fn parse_url_for_masking_report(raw_url: &str, page_url: &str) -> Option<url::Url> {
+    url::Url::parse(raw_url).ok().or_else(|| {
+        let base_url = url::Url::parse(page_url).ok()?;
+        base_url.join(raw_url).ok()
+    })
+}
+
+fn collect_masked_query_params(
+    url: &url::Url,
+    allowed_keys: &HashSet<&str>,
+    masked_keys: &mut HashSet<String>,
+    total_items_masked: &mut usize,
+) {
+    for (key, value) in url.query_pairs() {
+        if allowed_keys.contains(key.as_ref()) || value.is_empty() {
+            continue;
+        }
+
+        masked_keys.insert(key.into_owned());
+        *total_items_masked += 1;
     }
 }
 
@@ -942,5 +1031,40 @@ mod tests {
             ]
         );
         assert_eq!(report.collected_at, now.to_rfc3339());
+    }
+
+    #[test]
+    fn test_url_masking_report_counts_masked_query_params() {
+        let captured = CapturedPage {
+            page_url: "http://host/page?pageNum=1&patientName=张三".into(),
+            requests: vec![CapturedRequest {
+                method: "GET".into(),
+                url: "http://host/gateway/pcm/v1/list?pageSize=20&phone=13800000000&status=OPEN"
+                    .into(),
+                status: 200,
+                duration_ms: 1,
+                trace_id: Some("trace-1".into()),
+                timestamp: "2026-06-03T12:00:00Z".into(),
+                request_type: "fetch".into(),
+                response_size: None,
+            }],
+        };
+        let privacy = PrivacyConfig {
+            mask_query_values: true,
+            allowed_query_keys: vec!["pageNum".into(), "pageSize".into()],
+        };
+
+        let report = url_masking_report(Some(&captured), &privacy);
+        assert_eq!(
+            report.masked_query_params,
+            vec![
+                "patientName".to_string(),
+                "phone".to_string(),
+                "status".to_string()
+            ]
+        );
+        assert_eq!(report.total_items_masked, 3);
+        assert!(report.removed_headers.is_empty());
+        assert!(!report.masked_sql_params);
     }
 }

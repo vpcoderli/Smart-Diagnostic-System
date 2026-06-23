@@ -2,7 +2,7 @@ use crate::config::PrivacyConfig;
 use crate::masking;
 use crate::models::{
     CapturedPage, CapturedRequest, CollectionReport, DiagnosisManifest, DiagnosisPackage,
-    ExplainPlan, LogEntry, MaskingReport, SqlTrace, TableStats,
+    ExplainPlan, LogEntry, MaskingReport, SlowSqlItem, SqlTrace, TableStats,
 };
 use crate::url_resolver;
 use anyhow::Result;
@@ -29,19 +29,12 @@ pub fn build_package(
         &package.captured_page,
         &package.logs,
         &package.sql_traces,
+        &package.slow_sqls,
         &package.explain_plans,
         &package.table_stats,
         package.collection_report.as_ref(),
+        Some(masking_report),
     )?;
-
-    if !package.slow_sqls.is_empty() {
-        zip.start_file("database/slow-sql.json", options)?;
-        zip.write_all(serde_json::to_string_pretty(&package.slow_sqls)?.as_bytes())?;
-    }
-
-    // privacy/masking-report.json
-    zip.start_file("privacy/masking-report.json", options)?;
-    zip.write_all(serde_json::to_string_pretty(masking_report)?.as_bytes())?;
 
     zip.finish()?;
     Ok(())
@@ -54,9 +47,11 @@ fn write_structured_contents<W: Write + std::io::Seek>(
     captured_page: &CapturedPage,
     logs: &[LogEntry],
     sql_traces: &[SqlTrace],
+    slow_sqls: &[SlowSqlItem],
     explain_plans: &[ExplainPlan],
     table_stats: &[TableStats],
     collection_report: Option<&CollectionReport>,
+    masking_report: Option<&MaskingReport>,
 ) -> Result<()> {
     zip.start_file("manifest.json", options)?;
     zip.write_all(serde_json::to_string_pretty(manifest)?.as_bytes())?;
@@ -89,6 +84,11 @@ fn write_structured_contents<W: Write + std::io::Seek>(
         zip.write_all(serde_json::to_string_pretty(sql_traces)?.as_bytes())?;
     }
 
+    if !slow_sqls.is_empty() {
+        zip.start_file("database/slow-sql.json", options)?;
+        zip.write_all(serde_json::to_string_pretty(slow_sqls)?.as_bytes())?;
+    }
+
     if !explain_plans.is_empty() {
         zip.start_file("database/explain-plans.json", options)?;
         zip.write_all(serde_json::to_string_pretty(explain_plans)?.as_bytes())?;
@@ -100,6 +100,11 @@ fn write_structured_contents<W: Write + std::io::Seek>(
     }
 
     write_collection_report(zip, options, collection_report)?;
+
+    if let Some(masking_report) = masking_report {
+        zip.start_file("privacy/masking-report.json", options)?;
+        zip.write_all(serde_json::to_string_pretty(masking_report)?.as_bytes())?;
+    }
 
     Ok(())
 }
@@ -294,17 +299,17 @@ pub fn read_package(zip_path: &Path) -> Result<DiagnosisPackage> {
     }
 
     // 读取 collection_report
-    let collection_report = match archive.by_name("collection_report/report.json") {
-        Ok(mut f) => {
-            let mut buf = String::new();
-            f.read_to_string(&mut buf)?;
-            Some(
-                serde_json::from_str(&buf)
-                    .map_err(|e| anyhow::anyhow!("解析 collection_report/report.json 失败: {}", e))?,
-            )
-        }
-        Err(_) => None,
-    };
+    let collection_report =
+        match archive.by_name("collection_report/report.json") {
+            Ok(mut f) => {
+                let mut buf = String::new();
+                f.read_to_string(&mut buf)?;
+                Some(serde_json::from_str(&buf).map_err(|e| {
+                    anyhow::anyhow!("解析 collection_report/report.json 失败: {}", e)
+                })?)
+            }
+            Err(_) => None,
+        };
 
     Ok(DiagnosisPackage {
         manifest,
@@ -345,9 +350,11 @@ pub fn build_quick_package(
     build_quick_package_with_manifest(
         logs,
         sql_traces,
+        &[],
         explain_plans,
         table_stats,
         &manifest,
+        None,
         None,
         output_path,
     )
@@ -376,6 +383,7 @@ pub fn build_realtime_package(
     build_realtime_package_with_manifest(
         logs,
         sql_traces,
+        &[],
         explain_plans,
         table_stats,
         captured_page,
@@ -383,6 +391,7 @@ pub fn build_realtime_package(
         &manifest,
         None,
         &privacy,
+        None,
         output_path,
     )
 }
@@ -390,10 +399,12 @@ pub fn build_realtime_package(
 pub fn build_quick_package_with_manifest(
     logs: &[LogEntry],
     sql_traces: &[SqlTrace],
+    slow_sqls: &[SlowSqlItem],
     explain_plans: &[ExplainPlan],
     table_stats: &[TableStats],
     manifest: &DiagnosisManifest,
     collection_report: Option<&CollectionReport>,
+    masking_report: Option<&MaskingReport>,
     output_path: &Path,
 ) -> Result<()> {
     if let Some(parent) = output_path.parent() {
@@ -416,9 +427,11 @@ pub fn build_quick_package_with_manifest(
         &captured_page,
         logs,
         sql_traces,
+        slow_sqls,
         explain_plans,
         table_stats,
         collection_report,
+        masking_report,
     )?;
 
     write_quick_contents(
@@ -437,6 +450,7 @@ pub fn build_quick_package_with_manifest(
 pub fn build_realtime_package_with_manifest(
     logs: &[LogEntry],
     sql_traces: &[SqlTrace],
+    slow_sqls: &[SlowSqlItem],
     explain_plans: &[ExplainPlan],
     table_stats: &[TableStats],
     captured_page: &CapturedPage,
@@ -444,6 +458,7 @@ pub fn build_realtime_package_with_manifest(
     manifest: &DiagnosisManifest,
     collection_report: Option<&CollectionReport>,
     privacy: &PrivacyConfig,
+    masking_report: Option<&MaskingReport>,
     output_path: &Path,
 ) -> Result<()> {
     if let Some(parent) = output_path.parent() {
@@ -467,9 +482,11 @@ pub fn build_realtime_package_with_manifest(
         &masked_page,
         logs,
         sql_traces,
+        slow_sqls,
         explain_plans,
         table_stats,
         collection_report,
+        masking_report,
     )?;
 
     write_quick_contents(
@@ -682,11 +699,19 @@ fn render_request_diagnosis_summary(
 }
 
 fn request_conclusion(req: &CapturedRequest, logs: &[&LogEntry]) -> &'static str {
-    if req.status >= 500 || logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("ERROR")) {
+    if req.status >= 500
+        || logs
+            .iter()
+            .any(|entry| entry.level.eq_ignore_ascii_case("ERROR"))
+    {
         "接口异常"
     } else if req.duration_ms > 2000 {
         "慢请求"
-    } else if req.status >= 400 || logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("WARN")) {
+    } else if req.status >= 400
+        || logs
+            .iter()
+            .any(|entry| entry.level.eq_ignore_ascii_case("WARN"))
+    {
         "日志告警"
     } else {
         "暂无明显异常"
@@ -703,19 +728,27 @@ fn request_evidence(
     if req.status >= 500 {
         evidence.push(format!("HTTP {}", req.status));
     }
-    if logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("ERROR")) {
+    if logs
+        .iter()
+        .any(|entry| entry.level.eq_ignore_ascii_case("ERROR"))
+    {
         evidence.push("ERROR 日志".to_string());
     }
-    if logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("WARN")) {
+    if logs
+        .iter()
+        .any(|entry| entry.level.eq_ignore_ascii_case("WARN"))
+    {
         evidence.push("WARN 日志".to_string());
     }
     if req.duration_ms > 2000 {
         evidence.push("慢请求".to_string());
     }
-    if sql_traces
-        .iter()
-        .any(|trace| trace.duration_ms.map(|duration| duration > 1000.0).unwrap_or(false))
-    {
+    if sql_traces.iter().any(|trace| {
+        trace
+            .duration_ms
+            .map(|duration| duration > 1000.0)
+            .unwrap_or(false)
+    }) {
         evidence.push("慢 SQL".to_string());
     }
     if plans.iter().any(|plan| plan.error.is_some()) {
@@ -737,7 +770,10 @@ fn request_priority(
         "SQL 执行计划失败原因".to_string()
     } else if !sql_traces.is_empty() {
         "相关 SQL、表数据量与索引".to_string()
-    } else if logs.iter().any(|entry| entry.level.eq_ignore_ascii_case("ERROR")) {
+    } else if logs
+        .iter()
+        .any(|entry| entry.level.eq_ignore_ascii_case("ERROR"))
+    {
         "异常日志和堆栈".to_string()
     } else {
         "请求状态、耗时和关联服务日志".to_string()
@@ -805,7 +841,11 @@ fn render_request_key_logs(trace_id: Option<&str>, logs: &[&LogEntry]) -> String
     for entry in display_logs {
         md.push_str(&format_log_line(entry));
         md.push('\n');
-        if let Some(stack) = entry.stack_trace.as_deref().filter(|stack| !stack.trim().is_empty()) {
+        if let Some(stack) = entry
+            .stack_trace
+            .as_deref()
+            .filter(|stack| !stack.trim().is_empty())
+        {
             md.push_str(stack);
             md.push('\n');
         }
@@ -853,7 +893,10 @@ fn render_request_sql_cards(
 
     let mut stats_map: HashMap<&str, Vec<&TableStats>> = HashMap::new();
     for stat in table_stats {
-        stats_map.entry(stat.table_name.as_str()).or_default().push(stat);
+        stats_map
+            .entry(stat.table_name.as_str())
+            .or_default()
+            .push(stat);
     }
 
     for (idx, trace) in sql_traces.iter().enumerate() {
@@ -913,7 +956,10 @@ fn render_request_sql_card(
             .collect();
         md.push_str(&format!("| 涉及表 | {} |\n", tables.join(", ")));
     }
-    md.push_str(&format!("| 参数状态 | {} |\n", parameter_status(trace, plans)));
+    md.push_str(&format!(
+        "| 参数状态 | {} |\n",
+        parameter_status(trace, plans)
+    ));
     md.push_str(&format!("| EXPLAIN 状态 | {} |\n\n", explain_status));
 
     md.push_str("```sql\n");
