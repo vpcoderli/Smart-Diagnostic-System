@@ -20,6 +20,7 @@ toml = "0.8"
 
 # Async
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -43,7 +44,13 @@ russh = "0.46"
 russh-keys = "0.46"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "mysql", "postgres", "chrono"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "mysql", "postgres", "chrono", "json"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Concurrency utilities
+futures = "0.3"
 
 # Tauri
 tauri = { version = "2", features = [] }
@@ -51,3 +58,6 @@ tauri-build = { version = "2", features = [] }
 
 # Shared crate
 diag-core = { path = "crates/diag-core" }
+
+# Test utilities
+tempfile = "3"

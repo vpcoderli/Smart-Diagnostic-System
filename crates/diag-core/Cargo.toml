@@ -13,4 +13,8 @@ thiserror = { workspace = true }
 regex = { workspace = true }
 zip = { workspace = true }
 tracing = { workspace = true }
+async-trait = { workspace = true }
 url = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
