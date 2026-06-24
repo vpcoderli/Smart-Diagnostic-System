@@ -13,6 +13,7 @@ pub struct AnalysisResult {
     pub request_summary: Vec<RequestSummary>,
     pub log_summary: LogSummary,
     pub sql_summary: Vec<SqlSummary>,
+    pub sql_trace_summary: Vec<SqlTraceSummary>,
     pub findings: Vec<Finding>,
     pub report_markdown: String,
 }
@@ -50,6 +51,17 @@ pub struct SqlSummary {
     pub rows_returned: Option<i64>,
     pub risk_level: String,
     pub risk_reasons: Vec<String>,
+}
+
+/// 从日志中提取的 SQL（按 traceId 关联，比 performance_schema 更精准）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlTraceSummary {
+    pub trace_id: String,
+    pub service: String,
+    pub sql_fingerprint: String,
+    pub tables: Vec<String>,
+    pub count: usize, // 同一 traceId 内的 SQL 条数
 }
 
 /// 导入诊断包
@@ -96,12 +108,27 @@ pub fn run_analysis(zip_path: String) -> Result<AnalysisResult, String> {
     // 3. SQL 分析
     let sql_summary = analyze_sql(&package);
 
+    // 3.5 SQL Trace 分析（按 traceId 关联，比 performance_schema 更精准）
+    let sql_trace_summary = analyze_sql_traces(&package);
+
     // 4. 规则引擎
-    let findings = rule_engine::diagnose(&package, &request_summary, &log_summary, &sql_summary);
+    let findings = rule_engine::diagnose(
+        &package,
+        &request_summary,
+        &log_summary,
+        &sql_summary,
+        &sql_trace_summary,
+    );
 
     // 5. 生成报告
-    let report_markdown =
-        report::generate_markdown(&package, &request_summary, &log_summary, &sql_summary, &findings);
+    let report_markdown = report::generate_markdown(
+        &package,
+        &request_summary,
+        &log_summary,
+        &sql_summary,
+        &sql_trace_summary,
+        &findings,
+    );
 
     let manifest = serde_json::to_value(&package.manifest).unwrap_or_default();
 
@@ -110,6 +137,7 @@ pub fn run_analysis(zip_path: String) -> Result<AnalysisResult, String> {
         request_summary,
         log_summary,
         sql_summary,
+        sql_trace_summary,
         findings,
         report_markdown,
     })
@@ -125,12 +153,16 @@ pub fn export_report(report_content: String, output_path: String) -> Result<Stri
 // ─── 内部分析函数 ───
 
 fn analyze_requests(package: &DiagnosisPackage) -> Vec<RequestSummary> {
+    let gateway_prefix = package.manifest.gateway_prefix
+        .as_deref()
+        .unwrap_or("/gateway");
+
     package
         .captured_page
         .requests
         .iter()
         .map(|req| {
-            let (service, api_path) = match url_resolver::resolve_url(&req.url, "/gateway") {
+            let (service, api_path) = match url_resolver::resolve_url(&req.url, gateway_prefix) {
                 Ok(r) => (r.service, r.api_path),
                 Err(_) => ("unknown".to_string(), req.url.clone()),
             };
@@ -187,6 +219,30 @@ fn analyze_logs(package: &DiagnosisPackage) -> LogSummary {
     summary.exception_classes = exception_set.into_iter().collect();
     summary.error_services = error_service_set.into_iter().collect();
     summary
+}
+
+fn analyze_sql_traces(package: &DiagnosisPackage) -> Vec<SqlTraceSummary> {
+    use std::collections::HashMap;
+
+    // 按 traceId 聚合
+    let mut by_trace: HashMap<String, Vec<&diag_core::models::SqlTrace>> = HashMap::new();
+    for trace in &package.sql_traces {
+        by_trace.entry(trace.trace_id.clone()).or_default().push(trace);
+    }
+
+    by_trace
+        .into_iter()
+        .map(|(trace_id, traces)| {
+            let first = traces[0];
+            SqlTraceSummary {
+                trace_id,
+                service: first.service.clone(),
+                sql_fingerprint: first.sql_fingerprint.clone(),
+                tables: first.tables.clone(),
+                count: traces.len(),
+            }
+        })
+        .collect()
 }
 
 fn analyze_sql(package: &DiagnosisPackage) -> Vec<SqlSummary> {

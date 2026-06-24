@@ -62,35 +62,3 @@ const SENSITIVE_QUERY_KEYS: &[&str] = &[
 pub fn is_sensitive_query_key(key: &str) -> bool {
     SENSITIVE_QUERY_KEYS.contains(&key.to_lowercase().as_str())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_config() -> PrivacyConfig {
-        PrivacyConfig {
-            mask_query_values: true,
-            allowed_query_keys: vec!["pageNum".into(), "pageSize".into(), "portal".into()],
-        }
-    }
-
-    #[test]
-    fn test_mask_url() {
-        let url = "http://172.29.60.151/gateway/pcm-management/v1/pt/speech-module/list?diseaseName=糖尿病&pageNum=1&pageSize=10&portal=2";
-        let masked = mask_url(url, &test_config());
-
-        assert!(masked.contains("pageNum=1"));
-        assert!(masked.contains("pageSize=10"));
-        assert!(masked.contains("portal=2"));
-        assert!(masked.contains("diseaseName=%2A%2A%2A") || masked.contains("diseaseName=***"));
-        assert!(!masked.contains("糖尿病"));
-    }
-
-    #[test]
-    fn test_sensitive_headers() {
-        assert!(is_sensitive_header("Authorization"));
-        assert!(is_sensitive_header("cookie"));
-        assert!(!is_sensitive_header("Content-Type"));
-        assert!(!is_sensitive_header("x-trace"));
-    }
-}

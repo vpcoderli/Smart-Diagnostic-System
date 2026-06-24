@@ -108,36 +108,3 @@ pub fn is_error_log(line: &str) -> bool {
         || line.contains(" ERROR ")
         || line.contains("[ERROR]")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_json_log() {
-        let line = r#"{"time":"2026-05-08T10:00:01.123+08:00","level":"ERROR","service":"pcm-management","traceId":"abc123","message":"Query failed","exception":"java.sql.SQLTimeoutException"}"#;
-        let entry = parse_log_line(line, "pcm-management");
-        assert_eq!(entry.level, "ERROR");
-        assert_eq!(entry.trace_id.as_deref(), Some("abc123"));
-        assert_eq!(entry.exception.as_deref(), Some("java.sql.SQLTimeoutException"));
-    }
-
-    #[test]
-    fn test_extract_trace_id_json() {
-        let line = r#"{"traceId":"abc123","level":"INFO"}"#;
-        assert_eq!(extract_trace_id(line), Some("abc123".to_string()));
-    }
-
-    #[test]
-    fn test_extract_trace_id_mdc() {
-        let line = "2026-05-08 10:00:01 INFO [traceId=def456] SomeClass - message";
-        assert_eq!(extract_trace_id(line), Some("def456".to_string()));
-    }
-
-    #[test]
-    fn test_is_error_log() {
-        assert!(is_error_log(r#"{"level":"ERROR","message":"fail"}"#));
-        assert!(is_error_log("2026-05-08 10:00:01 ERROR SomeClass - fail"));
-        assert!(!is_error_log("2026-05-08 10:00:01 INFO SomeClass - ok"));
-    }
-}

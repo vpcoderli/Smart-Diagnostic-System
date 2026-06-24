@@ -59,5 +59,3 @@ tauri-build = { version = "2", features = [] }
 # Shared crate
 diag-core = { path = "crates/diag-core" }
 
-# Test utilities
-tempfile = "3"

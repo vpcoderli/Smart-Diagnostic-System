@@ -437,13 +437,10 @@ pub fn build_quick_package_with_manifest(
         masking_report,
     )?;
 
-    write_quick_contents(
-        &mut zip,
-        options,
-        logs,
-        sql_traces,
-        explain_plans,
-        table_stats,
+    zip.start_file("diagnosis-report.md", options)?;
+    zip.write_all(
+        render_quick_unified_report_md(logs, sql_traces, explain_plans, table_stats, manifest)
+            .as_bytes(),
     )?;
 
     zip.finish()?;
@@ -492,30 +489,9 @@ pub fn build_realtime_package_with_manifest(
         masking_report,
     )?;
 
-    write_quick_contents(
-        &mut zip,
-        options,
-        logs,
-        sql_traces,
-        explain_plans,
-        table_stats,
-    )?;
-
-    zip.start_file("realtime/overview.md", options)?;
+    zip.start_file("diagnosis-report.md", options)?;
     zip.write_all(
-        render_realtime_overview_md(
-            &masked_page,
-            logs,
-            sql_traces,
-            explain_plans,
-            gateway_prefix,
-        )
-        .as_bytes(),
-    )?;
-
-    zip.start_file("realtime/request-cards.md", options)?;
-    zip.write_all(
-        render_realtime_request_cards_md(
+        render_realtime_unified_report_md(
             &masked_page,
             logs,
             sql_traces,
@@ -525,9 +501,6 @@ pub fn build_realtime_package_with_manifest(
         )
         .as_bytes(),
     )?;
-
-    zip.start_file("realtime/request-logs.md", options)?;
-    zip.write_all(render_realtime_request_logs_md(&masked_page, logs).as_bytes())?;
 
     zip.finish()?;
     Ok(())
@@ -1091,17 +1064,17 @@ fn render_request_evidence_links(logs: &[&LogEntry], sql_traces: &[&SqlTrace]) -
     sql_services.dedup();
 
     let mut md = String::new();
-    md.push_str("### 完整证据\n\n");
+    md.push_str("### 关联证据\n\n");
     if log_services.is_empty() && sql_services.is_empty() {
-        md.push_str("- 未关联到服务级原始证据\n\n");
+        md.push_str("- 未关联到服务级证据\n\n");
         return md;
     }
 
-    for service in log_services {
-        md.push_str(&format!("- 完整服务日志：`{}.txt`\n", service));
+    if !log_services.is_empty() {
+        md.push_str(&format!("- 关联日志服务：{}\n", log_services.join("、")));
     }
-    for service in sql_services {
-        md.push_str(&format!("- 服务 SQL 报告：`{}_sql.md`\n", service));
+    if !sql_services.is_empty() {
+        md.push_str(&format!("- 关联 SQL 服务：{}\n", sql_services.join("、")));
     }
     md.push('\n');
     md
@@ -1175,43 +1148,60 @@ fn executable_sql_for_trace(trace: &SqlTrace, plans: &[&ExplainPlan]) -> String 
     })
 }
 
-fn write_quick_contents<W: Write + std::io::Seek>(
-    zip: &mut zip::ZipWriter<W>,
-    options: zip::write::SimpleFileOptions,
+/// 实时模式统一报告：将总览表格 + 单请求排查卡片合并为一个 Markdown
+fn render_realtime_unified_report_md(
+    captured_page: &CapturedPage,
     logs: &[LogEntry],
     sql_traces: &[SqlTrace],
     explain_plans: &[ExplainPlan],
     table_stats: &[TableStats],
-) -> Result<()> {
-    // 按 service 分组输出日志 TXT
-    let mut logs_by_svc: HashMap<&str, Vec<&LogEntry>> = HashMap::new();
-    for entry in logs {
-        logs_by_svc
-            .entry(entry.service.as_str())
-            .or_default()
-            .push(entry);
+    gateway_prefix: &str,
+) -> String {
+    let mut md = String::new();
+
+    // Part 1: 总览表格
+    md.push_str(&render_realtime_overview_md(
+        captured_page,
+        logs,
+        sql_traces,
+        explain_plans,
+        gateway_prefix,
+    ));
+
+    md.push_str("\n---\n\n");
+
+    // Part 2: 排查卡片（含日志、SQL、EXPLAIN、表统计）
+    md.push_str(&render_realtime_request_cards_md(
+        captured_page,
+        logs,
+        sql_traces,
+        explain_plans,
+        table_stats,
+        gateway_prefix,
+    ));
+
+    md
+}
+
+/// 历史/快速模式统一报告：按 traceId 分组展示日志 + SQL + EXPLAIN
+fn render_quick_unified_report_md(
+    logs: &[LogEntry],
+    sql_traces: &[SqlTrace],
+    explain_plans: &[ExplainPlan],
+    table_stats: &[TableStats],
+    manifest: &DiagnosisManifest,
+) -> String {
+    let mut md = String::new();
+    md.push_str("# 诊断报告\n\n");
+    md.push_str(&format!("诊断 ID：{}\n\n", manifest.diagnosis_id));
+    if let Some(ref time_range) = manifest.time_range {
+        md.push_str(&format!(
+            "时间范围：{} ~ {}\n\n",
+            time_range.start, time_range.end
+        ));
     }
 
-    for (svc, entries) in &logs_by_svc {
-        let filename = format!("{}.txt", svc);
-        zip.start_file(&filename, options)?;
-        for entry in entries {
-            let line = format_log_line(entry);
-            zip.write_all(line.as_bytes())?;
-            zip.write_all(b"\n")?;
-        }
-    }
-
-    // 按 service 分组输出 SQL Markdown
-    let mut sql_by_svc: HashMap<&str, Vec<&SqlTrace>> = HashMap::new();
-    for trace in sql_traces {
-        sql_by_svc
-            .entry(trace.service.as_str())
-            .or_default()
-            .push(trace);
-    }
-
-    // 构建 table_name -> TableStats 列表索引；同名表可能存在于多个 PostgreSQL schema。
+    // 构建索引
     let mut stats_map: HashMap<&str, Vec<&TableStats>> = HashMap::new();
     for stat in table_stats {
         stats_map
@@ -1219,9 +1209,6 @@ fn write_quick_contents<W: Write + std::io::Seek>(
             .or_default()
             .push(stat);
     }
-
-    // 构建 sql_fingerprint -> Vec<&ExplainPlan> 索引
-    // 同一 fingerprint 可能既来自 db_collector 也来自 log_sql_explain，需都展示
     let mut explain_map: HashMap<&str, Vec<&ExplainPlan>> = HashMap::new();
     for ep in explain_plans {
         explain_map
@@ -1230,31 +1217,7 @@ fn write_quick_contents<W: Write + std::io::Seek>(
             .push(ep);
     }
 
-    for (svc, traces) in &sql_by_svc {
-        let filename = format!("{}_sql.md", svc);
-        zip.start_file(&filename, options)?;
-
-        let header = format!("# SQL 诊断报告 - {}\n\n", svc);
-        zip.write_all(header.as_bytes())?;
-
-        let summary = format!(
-            "**SQL 数量**：{}　|　**执行计划**：{}　|　**统计表**：{}\n\n---\n\n",
-            traces.len(),
-            explain_plans.len(),
-            table_stats.len(),
-        );
-        zip.write_all(summary.as_bytes())?;
-
-        for (idx, trace) in traces.iter().enumerate() {
-            let section = render_sql_trace_md(idx + 1, trace, &stats_map, &explain_map);
-            zip.write_all(section.as_bytes())?;
-        }
-    }
-
-    Ok(())
-}
-
-fn render_realtime_request_logs_md(captured_page: &CapturedPage, logs: &[LogEntry]) -> String {
+    // 按 traceId 分组日志
     let mut logs_by_trace: HashMap<&str, Vec<&LogEntry>> = HashMap::new();
     for entry in logs {
         if let Some(trace_id) = entry.trace_id.as_deref().filter(|id| !id.is_empty()) {
@@ -1262,52 +1225,112 @@ fn render_realtime_request_logs_md(captured_page: &CapturedPage, logs: &[LogEntr
         }
     }
 
-    let captured_trace_ids: HashSet<&str> = captured_page
-        .requests
-        .iter()
-        .filter_map(|r| r.trace_id.as_deref())
-        .filter(|id| !id.is_empty())
+    // 按 traceId 分组 SQL
+    let mut sql_by_trace: HashMap<&str, Vec<&SqlTrace>> = HashMap::new();
+    for trace in sql_traces {
+        if !trace.trace_id.is_empty() {
+            sql_by_trace
+                .entry(trace.trace_id.as_str())
+                .or_default()
+                .push(trace);
+        }
+    }
+
+    // 收集所有 traceId
+    let mut all_trace_ids: Vec<&str> = logs_by_trace
+        .keys()
+        .chain(sql_by_trace.keys())
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
         .collect();
+    all_trace_ids.sort();
 
-    let mut md = String::new();
-    md.push_str("# 实时请求日志分组\n\n");
-    md.push_str(&format!("页面 URL：{}\n\n", captured_page.page_url));
+    if all_trace_ids.is_empty() {
+        md.push_str("> 未采集到任何 traceId 关联的日志或 SQL\n\n");
+        return md;
+    }
 
-    for (idx, req) in captured_page.requests.iter().enumerate() {
-        let trace_id = req.trace_id.as_deref().filter(|id| !id.is_empty());
-        let trace_label = trace_id.unwrap_or("无 traceId");
-        md.push_str(&format!("## {}. x-trace：`{}`\n\n", idx + 1, trace_label));
-        md.push_str(&render_request_meta(req));
+    // 总览
+    md.push_str("## 一、总览\n\n");
+    md.push_str("| # | traceId | 日志条数 | SQL 条数 |\n");
+    md.push_str("|---|---------|----------|----------|\n");
+    for (idx, trace_id) in all_trace_ids.iter().enumerate() {
+        let log_count = logs_by_trace.get(trace_id).map(|v| v.len()).unwrap_or(0);
+        let sql_count = sql_by_trace.get(trace_id).map(|v| v.len()).unwrap_or(0);
+        md.push_str(&format!(
+            "| {} | `{}` | {} | {} |\n",
+            idx + 1,
+            trace_id,
+            log_count,
+            sql_count,
+        ));
+    }
+    md.push_str("\n---\n\n");
 
-        match trace_id.and_then(|id| logs_by_trace.get(id)) {
-            Some(entries) if !entries.is_empty() => {
-                md.push_str("```text\n");
-                for entry in entries {
-                    md.push_str(&format_log_line(entry));
+    // 每个 traceId 一个排查卡片
+    md.push_str("## 二、排查详情\n\n");
+    for (idx, trace_id) in all_trace_ids.iter().enumerate() {
+        md.push_str(&format!("### {}. traceId：`{}`\n\n", idx + 1, trace_id));
+
+        // 日志
+        md.push_str("#### 关键日志\n\n");
+        if let Some(entries) = logs_by_trace.get(trace_id) {
+            let key_logs: Vec<&LogEntry> = entries
+                .iter()
+                .copied()
+                .filter(|entry| is_key_log(entry))
+                .collect();
+            let display = if key_logs.is_empty() {
+                sort_log_refs(entries.to_vec())
+            } else {
+                sort_log_refs(key_logs)
+            };
+            md.push_str("```text\n");
+            for entry in display {
+                md.push_str(&format_log_line(entry));
+                md.push('\n');
+                if let Some(stack) = entry
+                    .stack_trace
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    md.push_str(stack);
                     md.push('\n');
                 }
-                md.push_str("```\n\n");
             }
-            _ => md.push_str("> 未查询到该 traceId 的日志\n\n"),
+            md.push_str("```\n\n");
+        } else {
+            md.push_str("> 未查询到该 traceId 的日志\n\n");
+        }
+
+        // SQL
+        if let Some(traces) = sql_by_trace.get(trace_id) {
+            md.push_str("#### 相关 SQL 与执行计划\n\n");
+            for (sql_idx, trace) in traces.iter().enumerate() {
+                let section =
+                    render_sql_trace_md(sql_idx + 1, trace, &stats_map, &explain_map);
+                md.push_str(&section);
+            }
         }
 
         md.push_str("---\n\n");
     }
 
+    // 未关联 traceId 的日志
     let unmatched: Vec<&LogEntry> = logs
         .iter()
         .filter(|entry| {
             entry
                 .trace_id
                 .as_deref()
-                .map(|id| !captured_trace_ids.contains(id))
+                .map(|id| id.is_empty())
                 .unwrap_or(true)
         })
         .collect();
-
     if !unmatched.is_empty() {
-        md.push_str("## 未匹配浏览器请求的日志\n\n```text\n");
-        for entry in unmatched {
+        md.push_str("## 三、未关联 traceId 的日志\n\n```text\n");
+        for entry in sort_log_refs(unmatched) {
             md.push_str(&format_log_line(entry));
             md.push('\n');
         }
@@ -1317,14 +1340,6 @@ fn render_realtime_request_logs_md(captured_page: &CapturedPage, logs: &[LogEntr
     md
 }
 
-fn render_request_meta(req: &CapturedRequest) -> String {
-    let start_time = request_start_time(&req.timestamp, req.duration_ms);
-    let end_time = request_end_time(&req.timestamp);
-    format!(
-        "Request URL：{}\n\nStatus Code：{}\n\nstartTime：{}\n\nendTime：{}\n\n",
-        req.url, req.status, start_time, end_time
-    )
-}
 
 fn request_start_time(completed_at: &str, duration_ms: u64) -> String {
     DateTime::parse_from_rfc3339(completed_at)

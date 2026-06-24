@@ -1,6 +1,6 @@
 use diag_core::models::{DiagnosisPackage, Finding};
 
-use crate::commands::{LogSummary, RequestSummary, SqlSummary};
+use crate::commands::{LogSummary, RequestSummary, SqlSummary, SqlTraceSummary};
 
 /// 生成 Markdown 诊断报告
 pub fn generate_markdown(
@@ -8,6 +8,7 @@ pub fn generate_markdown(
     requests: &[RequestSummary],
     logs: &LogSummary,
     sqls: &[SqlSummary],
+    sql_traces: &[SqlTraceSummary],
     findings: &[Finding],
 ) -> String {
     let m = &package.manifest;
@@ -33,17 +34,9 @@ pub fn generate_markdown(
     md.push_str("| 接口路径 | 服务 | 方法 | 耗时 | 状态码 | TraceId | 风险 |\n");
     md.push_str("|---------|------|------|-----:|-------:|---------|------|\n");
     for req in requests {
-        let trace_display = req
-            .trace_id
-            .as_deref()
-            .map(|t| {
-                if t.len() > 8 {
-                    format!("{}...", &t[..8])
-                } else {
-                    t.to_string()
-                }
-            })
-            .unwrap_or_else(|| "❌ 缺失".to_string());
+        let trace_display = req.trace_id.as_deref()
+            .unwrap_or("❌ 缺失")
+            .to_string();
 
         let risk_icon = match req.risk_level.as_str() {
             "ERROR" => "🔴",
@@ -80,7 +73,53 @@ pub fn generate_markdown(
             logs.error_services.join(", ")
         ));
     }
+
+    // ERROR 日志样本（前 5 条）
+    let error_samples: Vec<&diag_core::models::LogEntry> = package.logs.iter()
+        .filter(|l| l.level == "ERROR")
+        .take(5)
+        .collect();
+
+    if !error_samples.is_empty() {
+        md.push_str("\n**ERROR 日志样本（前 5 条）:**\n\n");
+        for (i, log) in error_samples.iter().enumerate() {
+            md.push_str(&format!(
+                "{}. `[{}]` **{}** `{}`  \n   {}\n",
+                i + 1,
+                log.time.as_deref().unwrap_or("?"),
+                log.service,
+                log.trace_id.as_deref().unwrap_or("无traceId"),
+                log.message
+            ));
+            if let Some(ref exc) = log.exception {
+                md.push_str(&format!("   > 异常: `{}`\n", exc));
+            }
+        }
+    }
     md.push_str("\n");
+
+    // SQL Trace（按 traceId 关联）
+    if !sql_traces.is_empty() {
+        md.push_str("## 3.5 按 TraceId 关联的 SQL\n\n");
+        md.push_str("| TraceId | 服务 | SQL 指纹 | 涉及表 | SQL 数 |\n");
+        md.push_str("|---------|------|---------|--------|-------|\n");
+        for st in sql_traces.iter().take(20) {
+            let fp = if st.sql_fingerprint.len() > 50 {
+                format!("{}...", &st.sql_fingerprint[..50])
+            } else {
+                st.sql_fingerprint.clone()
+            };
+            md.push_str(&format!(
+                "| `{}` | {} | `{}` | {} | {} |\n",
+                st.trace_id,
+                st.service,
+                fp,
+                if st.tables.is_empty() { "-".to_string() } else { st.tables.join(", ") },
+                st.count
+            ));
+        }
+        md.push_str("\n");
+    }
 
     // SQL 分析
     if !sqls.is_empty() {

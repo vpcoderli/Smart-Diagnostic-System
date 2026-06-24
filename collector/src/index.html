@@ -3,139 +3,921 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>智慧诊断 - 问题收集端</title>
+  <title>Smart Diagnostic Collector</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="app">
-    <header class="header">
-      <div class="header-brand">
-        <span class="header-icon">🔍</span>
-        <h1>智慧诊断 · 问题收集端</h1>
-      </div>
-      <span class="header-version">v0.1.0</span>
-    </header>
 
-    <!-- 步骤指示器 -->
-    <nav class="stepper">
-      <div class="step-item active" data-step="1"><span class="step-num">1</span>导入部署</div>
-      <div class="step-divider"></div>
-      <div class="step-item" data-step="2"><span class="step-num">2</span>连通校验</div>
-      <div class="step-divider"></div>
-      <div class="step-item" data-step="3"><span class="step-num">3</span>问题采集</div>
+<!-- ═══ SVG Sprite ═══ -->
+<svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="icon-arrow-right" viewBox="0 0 24 24">
+    <path d="M5 12h14M12 5l7 7-7 7"/>
+  </symbol>
+  <symbol id="icon-arrow-left" viewBox="0 0 24 24">
+    <path d="M19 12H5M12 19l-7-7 7-7"/>
+  </symbol>
+  <symbol id="icon-check" viewBox="0 0 24 24">
+    <path d="M20 6L9 17l-5-5"/>
+  </symbol>
+  <symbol id="icon-x" viewBox="0 0 24 24">
+    <path d="M18 6L6 18M6 6l12 12"/>
+  </symbol>
+  <symbol id="icon-info" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="10"/>
+    <path d="M12 16v-4M12 8h.01"/>
+  </symbol>
+  <symbol id="icon-warning" viewBox="0 0 24 24">
+    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+    <path d="M12 9v4M12 17h.01"/>
+  </symbol>
+  <symbol id="icon-server" viewBox="0 0 24 24">
+    <rect x="2" y="2" width="20" height="8" rx="2"/>
+    <rect x="2" y="14" width="20" height="8" rx="2"/>
+    <path d="M6 6h.01M6 18h.01"/>
+  </symbol>
+  <symbol id="icon-db" viewBox="0 0 24 24">
+    <ellipse cx="12" cy="5" rx="9" ry="3"/>
+    <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+    <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+  </symbol>
+  <symbol id="icon-cloud" viewBox="0 0 24 24">
+    <path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/>
+  </symbol>
+  <symbol id="icon-terminal" viewBox="0 0 24 24">
+    <polyline points="4 17 10 11 4 5"/>
+    <line x1="12" y1="19" x2="20" y2="19"/>
+  </symbol>
+  <symbol id="icon-folder" viewBox="0 0 24 24">
+    <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
+  </symbol>
+  <symbol id="icon-eye" viewBox="0 0 24 24">
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+    <circle cx="12" cy="12" r="3"/>
+  </symbol>
+  <symbol id="icon-eye-off" viewBox="0 0 24 24">
+    <path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/>
+    <line x1="1" y1="1" x2="23" y2="23"/>
+  </symbol>
+  <symbol id="icon-refresh" viewBox="0 0 24 24">
+    <polyline points="23 4 23 10 17 10"/>
+    <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+  </symbol>
+  <symbol id="icon-play" viewBox="0 0 24 24">
+    <polygon points="5 3 19 12 5 21 5 3"/>
+  </symbol>
+  <symbol id="icon-stop" viewBox="0 0 24 24">
+    <rect x="3" y="3" width="18" height="18" rx="2"/>
+  </symbol>
+  <symbol id="icon-search" viewBox="0 0 24 24">
+    <circle cx="11" cy="11" r="8"/>
+    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+  </symbol>
+  <symbol id="icon-clock" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="10"/>
+    <polyline points="12 6 12 12 16 14"/>
+  </symbol>
+  <symbol id="icon-download" viewBox="0 0 24 24">
+    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+    <polyline points="7 10 12 15 17 10"/>
+    <line x1="12" y1="15" x2="12" y2="3"/>
+  </symbol>
+  <symbol id="icon-settings" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="3"/>
+    <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+  </symbol>
+  <symbol id="icon-chevron-down" viewBox="0 0 24 24">
+    <polyline points="6 9 12 15 18 9"/>
+  </symbol>
+  <symbol id="icon-package" viewBox="0 0 24 24">
+    <line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/>
+    <path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/>
+    <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+    <line x1="12" y1="22.08" x2="12" y2="12"/>
+  </symbol>
+</svg>
+
+<div class="app-shell">
+
+  <!-- ═══ Sidebar ═══ -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <div class="brand-name">Smart Diag</div>
+      <div class="brand-sub">Collector v0.2</div>
+    </div>
+
+    <nav class="step-nav">
+      <div class="step-item active" id="nav-step-1" data-step="1">
+        <span class="step-num" id="step-num-1">1</span>
+        <span class="step-label">通用信息</span>
+      </div>
+      <div class="step-item" id="nav-step-2" data-step="2">
+        <span class="step-num" id="step-num-2">2</span>
+        <span class="step-label">日志配置</span>
+      </div>
+      <div class="step-item" id="nav-step-3" data-step="3">
+        <span class="step-num" id="step-num-3">3</span>
+        <span class="step-label">数据库与模式</span>
+      </div>
+      <div class="step-item" id="nav-step-4" data-step="4">
+        <span class="step-num" id="step-num-4">4</span>
+        <span class="step-label">诊断采集</span>
+      </div>
     </nav>
 
-    <main class="main">
-      <!-- ═══ Phase 1: 导入部署文档 ═══ -->
-      <div id="phase-1" class="phase">
-        <section class="card">
-          <h2>📋 站点信息</h2>
-          <div class="form-grid">
-            <div class="form-group">
-              <label>医院站点名称</label>
-              <input type="text" id="site-name" placeholder="如: hospital-a" />
+    <div class="sidebar-footer">
+      <!-- 配置保存状态 -->
+      <div class="config-status" id="config-status" style="display:none">
+        <svg class="icon icon-sm" aria-hidden="true" id="config-status-icon"><use href="#icon-check"/></svg>
+        <span id="config-status-text">配置已保存</span>
+      </div>
+      <!-- 一键清空 -->
+      <button class="btn-clear-config" id="btn-clear-config" type="button" style="display:none" title="清空所有已保存的配置，重新开始">
+        <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-x"/></svg>
+        清空配置
+      </button>
+      <div class="sidebar-about">
+        <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-settings"/></svg>
+        <span>v0.2.0</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ═══ Main Content ═══ -->
+  <main class="main-content">
+
+    <!-- ═══ Phase 1: 通用配置 ═══ -->
+    <div id="phase-1" class="phase active">
+      <div class="page-header">
+        <div class="page-title">通用配置</div>
+        <div class="page-desc">配置项目站点名称、诊断包保存路径与定时巡检策略</div>
+      </div>
+
+      <!-- 站点信息 -->
+      <div class="card">
+        <div class="card-title">
+          <svg class="icon" aria-hidden="true"><use href="#icon-server"/></svg>
+          站点信息
+        </div>
+        <div class="field-row field-row-2">
+          <div class="field">
+            <label class="label" for="site-name">站点名称 <span class="required">*</span></label>
+            <input class="input" type="text" id="site-name" placeholder="如: hospital-a" autocomplete="off"/>
+          </div>
+          <div class="field">
+            <label class="label" for="gateway-prefix">网关前缀</label>
+            <input class="input" type="text" id="gateway-prefix" value="/gateway" autocomplete="off"/>
+          </div>
+        </div>
+      </div>
+
+      <!-- 诊断包输出 -->
+      <div class="card">
+        <div class="card-title">
+          <svg class="icon" aria-hidden="true"><use href="#icon-package"/></svg>
+          诊断包输出
+        </div>
+        <div class="field">
+          <label class="label" for="output-path">保存路径</label>
+          <div class="input-with-btn">
+            <input class="input" type="text" id="output-path" placeholder="点击浏览选择..." autocomplete="off"/>
+            <button class="btn btn-secondary btn-sm" id="btn-browse-path" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-folder"/></svg>
+              浏览
+            </button>
+          </div>
+        </div>
+        <div class="field" style="max-width:160px">
+          <label class="label" for="output-retention">保留天数</label>
+          <input class="input" type="number" id="output-retention" value="7" min="1" max="365"/>
+        </div>
+      </div>
+
+      <!-- 定时巡检 -->
+      <div class="card">
+        <div class="card-title">
+          <svg class="icon" aria-hidden="true"><use href="#icon-clock"/></svg>
+          定时巡检
+          <div class="toggle-row" style="margin-left:auto" id="schedule-toggle-row">
+            <label class="toggle-switch" for="schedule-enabled">
+              <input type="checkbox" id="schedule-enabled"/>
+              <span class="toggle-track"></span>
+              <span class="toggle-thumb"></span>
+            </label>
+          </div>
+        </div>
+        <div id="schedule-fields" style="display:none">
+          <div class="field-row field-row-2">
+            <div class="field">
+              <label class="label" for="schedule-interval">间隔（分钟）</label>
+              <input class="input" type="number" id="schedule-interval" value="5" min="1" max="1440"/>
             </div>
-            <div class="form-group">
-              <label>网关前缀</label>
-              <input type="text" id="gateway-prefix" value="/gateway" />
+            <div class="field">
+              <label class="label" for="schedule-lookback">回看窗口（分钟）</label>
+              <input class="input" type="number" id="schedule-lookback" value="6" min="1" max="1440"/>
+            </div>
+            <div class="field">
+              <label class="label" for="schedule-max-traces">单次上限（traceId）</label>
+              <input class="input" type="number" id="schedule-max-traces" value="50" min="1" max="500"/>
+            </div>
+            <div class="field">
+              <label class="label" for="schedule-dedup-window">去重窗口（分钟）</label>
+              <input class="input" type="number" id="schedule-dedup-window" value="60" min="1" max="1440"/>
             </div>
           </div>
-        </section>
-
-        <section class="card">
-          <h2>🖥️ 服务部署信息</h2>
-          <p class="hint">导入服务部署 CSV 文件（项目名、服务器IP、用户名、密码、日志路径）</p>
-          <div class="import-area">
-            <button id="btn-dl-svc-tpl" class="btn btn-outline">📥 下载模板</button>
-            <div class="file-drop" id="svc-drop">
-              <input type="file" id="svc-file" accept=".csv" hidden />
-              <span>点击选择或拖入 服务部署.csv</span>
+          <div class="field">
+            <label class="label">过滤级别</label>
+            <div class="checkbox-group">
+              <label class="checkbox-item">
+                <input type="checkbox" id="schedule-level-error" checked/>
+                <span>ERROR</span>
+              </label>
+              <label class="checkbox-item">
+                <input type="checkbox" id="schedule-level-warn" checked/>
+                <span>WARN</span>
+              </label>
+              <label class="checkbox-item">
+                <input type="checkbox" id="schedule-level-info"/>
+                <span>INFO</span>
+              </label>
             </div>
+          </div>
+          <div class="field" style="margin-top:8px">
+            <label class="label" for="schedule-extra-keywords">额外关键词（空格分隔）</label>
+            <input class="input" type="text" id="schedule-extra-keywords" placeholder="如: Timeout OOM OutOfMemory"/>
+          </div>
+        </div>
+      </div>
+
+      <!-- Action Bar -->
+      <div class="action-bar">
+        <div class="action-bar-hint">
+          <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-info"/></svg>
+          配置自动已保存
+        </div>
+        <div class="action-bar-btns">
+          <button class="btn btn-primary" id="btn-goto-phase2" disabled>
+            下一步：日志配置
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-arrow-right"/></svg>
+          </button>
+        </div>
+      </div>
+    </div><!-- /phase-1 -->
+
+
+    <!-- ═══ Phase 2: 日志配置 ═══ -->
+    <div id="phase-2" class="phase">
+      <div class="page-header">
+        <div class="page-title">日志配置</div>
+        <div class="page-desc">配置系统日志来源并测试连接可用性</div>
+      </div>
+
+      <!-- 日志来源 -->
+      <div class="card">
+        <div class="card-title">
+          <svg class="icon" aria-hidden="true"><use href="#icon-cloud"/></svg>
+          日志来源
+        </div>
+        <div class="source-cards">
+          <div class="source-card selected" id="source-elk" role="button" tabindex="0">
+            <div class="source-card-title">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-cloud"/></svg>
+              ELK 模式
+            </div>
+            <div class="source-card-desc">通过 Elasticsearch 查询日志</div>
+          </div>
+          <div class="source-card" id="source-ssh" role="button" tabindex="0">
+            <div class="source-card-title">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-terminal"/></svg>
+              SSH 模式
+            </div>
+            <div class="source-card-desc">SSH 连接服务器 grep 日志</div>
+          </div>
+        </div>
+
+        <!-- ELK 配置区 -->
+        <div id="elk-config-area">
+          <div class="field-row field-row-2">
+            <div class="field">
+              <label class="label" for="elk-address">ELK 地址 <span class="required">*</span></label>
+              <input class="input" type="text" id="elk-address" placeholder="http://elk-host:9200" autocomplete="off"/>
+            </div>
+            <div class="field">
+              <label class="label" for="elk-index-pattern">索引模式 <span class="required">*</span></label>
+              <input class="input" type="text" id="elk-index-pattern" value="logstash-*" autocomplete="off"/>
+            </div>
+          </div>
+          <div class="field-row field-row-2">
+            <div class="field">
+              <label class="label" for="elk-username">用户名</label>
+              <input class="input" type="text" id="elk-username" placeholder="elastic（可选）" autocomplete="off"/>
+            </div>
+            <div class="field">
+              <label class="label" for="elk-password">密码</label>
+              <div class="input-wrap">
+                <input class="input" type="password" id="elk-password" placeholder="（可选）" autocomplete="off"/>
+                <button class="input-eye" id="btn-elk-eye" type="button" aria-label="显示/隐藏密码">
+                  <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-eye" id="elk-eye-icon"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <button class="adv-toggle" id="elk-adv-toggle" type="button" aria-expanded="false">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-chevron-down"/></svg>
+            高级字段映射
+          </button>
+          <div class="adv-content" id="elk-adv-content">
+            <div class="field-row field-row-2" style="margin-top:12px">
+              <div class="field">
+                <label class="label" for="elk-field-timestamp">时间戳字段</label>
+                <input class="input" type="text" id="elk-field-timestamp" value="@timestamp"/>
+              </div>
+              <div class="field">
+                <label class="label" for="elk-field-level">日志级别字段</label>
+                <input class="input" type="text" id="elk-field-level" value="level"/>
+              </div>
+              <div class="field">
+                <label class="label" for="elk-field-traceid">TraceId 字段</label>
+                <input class="input" type="text" id="elk-field-traceid" value="x0"/>
+              </div>
+              <div class="field">
+                <label class="label" for="elk-field-service">服务名字段</label>
+                <input class="input" type="text" id="elk-field-service" value="serviceName"/>
+              </div>
+              <div class="field">
+                <label class="label" for="elk-field-message">消息字段</label>
+                <input class="input" type="text" id="elk-field-message" value="msg"/>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- SSH 配置区 -->
+        <div id="ssh-config-area" style="display:none">
+          <div class="inline-msg info" style="margin-bottom:12px">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-info"/></svg>
+            SSH 模式需上传服务器配置 CSV，包含服务器 IP、用户名、密码和日志路径。
+          </div>
+          <div style="display:flex;gap:8px;margin-bottom:10px">
+            <button class="btn btn-secondary btn-sm" id="btn-dl-svc-tpl" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-download"/></svg>
+              下载模板
+            </button>
+          </div>
+          <div class="file-drop-wrap" id="svc-drop" role="button" tabindex="0">
+            <input type="file" id="svc-file" accept=".csv" hidden/>
+            <svg class="icon icon-lg" style="margin-bottom:6px;color:var(--text-3)" aria-hidden="true"><use href="#icon-folder"/></svg>
+            <div class="file-drop-text">点击选择或拖入 服务部署.csv</div>
           </div>
           <div id="svc-preview" class="preview-table" style="display:none"></div>
-          <div id="svc-status" class="status-msg"></div>
-        </section>
-
-        <section class="card">
-          <h2>🗄️ 数据库信息</h2>
-          <p class="hint">导入数据库部署 CSV 文件（类型、IP、端口、用户名、密码、库名）</p>
-          <div class="import-area">
-            <button id="btn-dl-db-tpl" class="btn btn-outline">📥 下载模板</button>
-            <div class="file-drop" id="db-drop">
-              <input type="file" id="db-file" accept=".csv" hidden />
-              <span>点击选择或拖入 数据库部署.csv</span>
-            </div>
-          </div>
-          <div id="db-preview" class="preview-table" style="display:none"></div>
-          <div id="db-status" class="status-msg"></div>
-        </section>
-
-        <div class="action-bar">
-          <button id="btn-to-validate" class="btn btn-primary" disabled>下一步：连通校验 →</button>
+          <div id="svc-msg" style="display:none"></div>
         </div>
       </div>
 
-      <!-- ═══ Phase 2: 连通校验 ═══ -->
-      <div id="phase-2" class="phase" style="display:none">
-        <section class="card">
-          <h2>🔗 服务连通校验</h2>
-          <p class="hint">逐个验证 SSH 连接和日志路径是否可达</p>
-          <div id="svc-validation-list" class="validation-list"></div>
-          <button id="btn-validate-svc" class="btn btn-primary">▶ 开始校验服务</button>
-        </section>
-
-        <section class="card">
-          <h2>🗄️ 数据库连通校验</h2>
-          <div id="db-validation-list" class="validation-list"></div>
-          <button id="btn-validate-db" class="btn btn-primary">▶ 开始校验数据库</button>
-        </section>
-
-        <div class="action-bar">
-          <button id="btn-back-import" class="btn btn-secondary">← 返回修改</button>
-          <button id="btn-to-collect" class="btn btn-primary" disabled>下一步：问题采集 →</button>
+      <!-- ELK 连通测试 -->
+      <div class="verify-card" id="elk-verify-card">
+        <div class="verify-card-head">
+          <div class="verify-card-info">
+            <div class="verify-card-name">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-cloud"/></svg>
+              ELK 连通测试
+            </div>
+            <div class="verify-card-addr" id="elk-verify-addr">-</div>
+          </div>
+          <div class="status-row" id="elk-status-row">
+            <span class="status-dot idle" id="elk-status-dot"></span>
+            <span id="elk-status-text" style="color:var(--text-3)">等待测试</span>
+          </div>
+        </div>
+        <div class="verify-card-body">
+          <div class="verify-result" id="elk-verify-result" style="margin-bottom:10px;min-height:16px"></div>
+          <button class="btn btn-secondary btn-sm" id="btn-test-elk" type="button">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+            测试 ELK 连接
+          </button>
         </div>
       </div>
 
-      <!-- ═══ Phase 3: URL 采集 ═══ -->
-      <div id="phase-3" class="phase" style="display:none">
-        <section class="card">
-          <h2>🌐 诊断目标</h2>
-          <div class="form-group">
-            <label>问题页面 URL</label>
-            <div class="form-row">
-              <input type="text" id="page-url" placeholder="http://172.29.60.151/patient-management" />
-              <button id="btn-open-page" class="btn btn-primary">打开诊断浏览器</button>
+      <!-- SSH 服务发现（仅 SSH 模式） -->
+      <div class="verify-card" id="ssh-verify-card" style="display:none">
+        <div class="verify-card-head">
+          <div class="verify-card-info">
+            <div class="verify-card-name">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-terminal"/></svg>
+              服务 SSH 校验
+            </div>
+            <div class="verify-card-addr">已导入服务配置</div>
+          </div>
+          <div class="status-row" id="ssh-status-row">
+            <span class="status-dot idle" id="ssh-status-dot"></span>
+            <span id="ssh-status-text" style="color:var(--text-3)">等待测试</span>
+          </div>
+        </div>
+        <div class="verify-card-body">
+          <div id="ssh-verify-list" style="margin-bottom:10px"></div>
+          <button class="btn btn-secondary btn-sm" id="btn-validate-svc" type="button">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+            校验服务 SSH
+          </button>
+        </div>
+      </div>
+
+      <!-- Action Bar -->
+      <div class="action-bar">
+        <div class="action-bar-btns" style="margin-right:auto">
+          <button class="btn btn-ghost" id="btn-backto-phase1" type="button">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-arrow-left"/></svg>
+            上一步：通用配置
+          </button>
+        </div>
+        <div class="action-bar-btns">
+          <button class="btn btn-primary" id="btn-goto-phase3" disabled>
+            下一步：数据库与模式
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-arrow-right"/></svg>
+          </button>
+        </div>
+      </div>
+    </div><!-- /phase-2 -->
+
+
+    <!-- ═══ Phase 3: 数据库与模式 ═══ -->
+    <div id="phase-3" class="phase">
+      <div class="page-header">
+        <div class="page-title">数据库与模式</div>
+        <div class="page-desc">配置业务数据库连接、选定数据架构并进行表结构分析</div>
+      </div>
+
+      <!-- 数据库连接配置 -->
+      <div class="card">
+        <div class="card-title">
+          <svg class="icon" aria-hidden="true"><use href="#icon-db"/></svg>
+          数据库连接
+        </div>
+        <div class="tab-bar" id="db-tab-bar">
+          <button class="tab-btn active" data-db-type="mysql" type="button">MySQL</button>
+          <button class="tab-btn" data-db-type="postgresql" type="button">PostgreSQL</button>
+        </div>
+        <div class="field-row field-row-3">
+          <div class="field">
+            <label class="label" for="db-host">主机地址</label>
+            <input class="input" type="text" id="db-host" placeholder="172.29.60.100" autocomplete="off"/>
+          </div>
+          <div class="field">
+            <label class="label" for="db-port">端口</label>
+            <input class="input" type="number" id="db-port" value="3306"/>
+          </div>
+        </div>
+        <div class="field-row field-row-eq">
+          <div class="field">
+            <label class="label" for="db-username">用户名</label>
+            <input class="input" type="text" id="db-username" placeholder="readonly" autocomplete="off"/>
+          </div>
+          <div class="field">
+            <label class="label" for="db-password">密码</label>
+            <div class="input-wrap">
+              <input class="input" type="password" id="db-password" placeholder="••••••" autocomplete="off"/>
+              <button class="input-eye" id="btn-db-eye" type="button" aria-label="显示/隐藏密码">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-eye" id="db-eye-icon"/></svg>
+              </button>
             </div>
           </div>
-          <p class="hint">输入出问题的页面地址，工具会捕获该页面所有 API 请求。</p>
-        </section>
-
-        <section class="card" id="capture-card" style="display:none">
-          <h2>📡 请求捕获</h2>
-          <div class="capture-toolbar">
-            <span>已捕获 <strong id="capture-count">0</strong> 个请求</span>
-            <button id="btn-stop" class="btn btn-warning">⏹ 采集完成</button>
+        </div>
+        <div class="field">
+          <label class="label" for="db-name">数据库名</label>
+          <div class="input-with-btn">
+            <input class="input" type="text" id="db-name" placeholder="先进行连接测试通过后选择" autocomplete="off"/>
+            <select class="input" id="db-name-select" style="display:none;">
+              <option value="">请选择数据库...</option>
+            </select>
           </div>
-          <div id="request-list" class="request-list"></div>
-        </section>
-
-        <section class="card" id="progress-card" style="display:none">
-          <h2>🔬 诊断进度</h2>
-          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
-          <div id="progress-steps" class="progress-steps"></div>
-          <div id="diag-status" class="status-msg"></div>
-        </section>
-
-        <section class="card" id="result-card" style="display:none">
-          <h2>✅ 诊断包已生成</h2>
-          <p>📁 输出路径: <code id="result-path"></code></p>
-          <div class="action-bar" style="margin-top:16px">
-            <button id="btn-new" class="btn btn-secondary">🔄 新建诊断</button>
+          <div class="hint" id="db-name-hint" style="margin-top:6px;color:#888;font-size:12px;">
+            提示：测试连接通过后会自动列出可用数据库，请选择具体的数据库以确保 SQL 查询可靠
           </div>
-        </section>
+        </div>
+        <div class="field" id="db-schema-row" style="display:none;">
+          <label class="label">模式（schema）— 可多选</label>
+          <div id="db-schema-list" style="border:1px solid var(--border, #30363d); border-radius:4px; padding:8px; max-height:180px; overflow-y:auto; background:var(--bg-input, #0d1117);">
+            <div style="color:#888; font-size:12px;">加载中...</div>
+          </div>
+          <div class="hint" id="db-schema-hint" style="margin-top:6px;color:#888;font-size:12px;">
+            PostgreSQL 表归属于具体的 schema，请勾选业务表所在的所有 schema（如 pcm_2912、outbound_platform）。
+          </div>
+        </div>
       </div>
-    </main>
-  </div>
-  <script src="app.js"></script>
+
+      <!-- 数据库连通测试 -->
+      <div class="verify-card" id="db-verify-card">
+        <div class="verify-card-head">
+          <div class="verify-card-info">
+            <div class="verify-card-name">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-db"/></svg>
+              数据库连通测试
+            </div>
+            <div class="verify-card-addr" id="db-verify-addr">-</div>
+          </div>
+          <div class="status-row" id="db-status-row">
+            <span class="status-dot idle" id="db-status-dot"></span>
+            <span id="db-status-text" style="color:var(--text-3)">等待测试</span>
+          </div>
+        </div>
+        <div class="verify-card-body">
+          <div class="verify-result" id="db-verify-result" style="margin-bottom:10px;min-height:16px"></div>
+          <button class="btn btn-secondary btn-sm" id="btn-test-db" type="button">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+            测试 DB 连接
+          </button>
+        </div>
+      </div>
+
+      <!-- 模式表预览 (Schema Tables Preview) -->
+      <div class="card" id="db-tables-preview-card" style="display:none;">
+        <div class="card-title">
+          <svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg>
+          模式表预览
+        </div>
+        <div class="field" style="margin-bottom:10px">
+          <input class="input" type="text" id="db-tables-search" placeholder="输入表名过滤..." autocomplete="off"/>
+        </div>
+        <div id="db-tables-preview-list" style="border:1px solid var(--border); border-radius:4px; padding:10px; max-height:220px; overflow-y:auto; background:var(--bg-input);">
+          <div style="color:var(--text-3); font-size:12px;">选择数据库后将自动载入表列表进行预览...</div>
+        </div>
+        <div class="hint" style="margin-top:6px;color:var(--text-3);font-size:11px;">
+          提示：以上为成功连接后读取的物理业务表，有助于运维核对表结构是否一致。
+        </div>
+      </div>
+
+      <!-- Action Bar -->
+      <div class="action-bar">
+        <div class="action-bar-btns" style="margin-right:auto">
+          <button class="btn btn-ghost" id="btn-backto-phase2" type="button">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-arrow-left"/></svg>
+            上一步：日志配置
+          </button>
+        </div>
+        <div class="action-bar-btns">
+          <button class="btn btn-primary" id="btn-goto-phase4" disabled>
+            确认，下一步：诊断采集
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-arrow-right"/></svg>
+          </button>
+        </div>
+      </div>
+    </div><!-- /phase-3 -->
+
+
+    <!-- ═══ Phase 4: 诊断采集 ═══ -->
+    <div id="phase-4" class="phase">
+      <div class="page-header" style="display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <div class="page-title">诊断采集</div>
+          <div class="page-desc">选择采集模式，抓取数据生成最终 ZIP 诊断包</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btn-backto-phase3-from-4" type="button" style="align-self:flex-start">
+          <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-arrow-left"/></svg>
+          返回数据库
+        </button>
+      </div>
+
+      <!-- 调度器状态条（仅定时巡检启用时显示） -->
+      <div class="sched-bar" id="sched-bar" style="display:none">
+        <div class="sched-bar-left">
+          <span class="sched-bar-label">定时巡检</span>
+          <span class="sched-badge" id="sched-badge">未启动</span>
+          <span class="sched-meta" id="sched-last-run"></span>
+          <span class="sched-meta" id="sched-pkg-count"></span>
+        </div>
+        <div class="sched-bar-right">
+          <button class="btn btn-ghost btn-sm" id="btn-sched-stop-bar" type="button">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-stop"/></svg>
+            停止
+          </button>
+        </div>
+      </div>
+
+      <!-- 模式选择 -->
+      <div class="mode-cards">
+        <div class="mode-card selected" id="mode-realtime" role="button" tabindex="0">
+          <div class="mode-card-title">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-search"/></svg>
+            实时模式
+          </div>
+          <div class="mode-card-desc">打开诊断浏览器捕获请求</div>
+        </div>
+        <div class="mode-card" id="mode-history" role="button" tabindex="0">
+          <div class="mode-card-title">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-clock"/></svg>
+            历史模式
+          </div>
+          <div class="mode-card-desc">按关键词查询历史日志</div>
+        </div>
+        <div class="mode-card" id="mode-scheduler" role="button" tabindex="0">
+          <div class="mode-card-title">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+            定时巡检
+          </div>
+          <div class="mode-card-desc">定时自动生成诊断包</div>
+        </div>
+        <div class="mode-card" id="mode-quick" role="button" tabindex="0">
+          <div class="mode-card-title">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-play"/></svg>
+            快速诊断
+          </div>
+          <div class="mode-card-desc">单 traceId 直出 TXT 诊断包</div>
+        </div>
+      </div>
+
+      <!-- 实时模式内容区 -->
+      <div id="section-realtime">
+        <div class="card">
+          <div class="card-title">
+            <svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg>
+            诊断目标
+          </div>
+          <div class="field">
+            <label class="label" for="page-url">问题页面 URL</label>
+            <div class="input-with-btn">
+              <input class="input" type="text" id="page-url" placeholder="http://172.29.60.151/patient-management" autocomplete="off"/>
+              <button class="btn btn-primary btn-sm" id="btn-open-browser" type="button">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-play"/></svg>
+                打开诊断浏览器
+              </button>
+            </div>
+            <span class="hint">在诊断浏览器中操作页面、复现问题后，返回点击「采集完成」</span>
+          </div>
+        </div>
+
+        <!-- 捕获进行中 -->
+        <div class="card" id="capture-card" style="display:none">
+          <div class="card-title" style="justify-content:space-between">
+            <span style="display:flex;align-items:center;gap:8px">
+              <svg class="icon" aria-hidden="true"><use href="#icon-cloud"/></svg>
+              实时请求捕获
+            </span>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="status-row">
+                <span class="status-dot testing" id="capture-dot"></span>
+                <span id="capture-indicator" style="font-size:12px;color:var(--text-2)">诊断浏览器运行中</span>
+              </div>
+              <span style="font-size:12px;color:var(--text-2)">已捕获 <strong id="capture-count" style="color:var(--text-1)">0</strong> 个请求</span>
+            </div>
+          </div>
+
+          <!-- 操作步骤引导 -->
+          <div id="login-guide" style="margin-bottom:14px;padding:12px 14px;background:var(--bg-raised);border-radius:var(--radius);border-left:3px solid var(--accent)">
+            <div style="font-size:12px;font-weight:500;color:var(--accent-txt);margin-bottom:6px">操作步骤</div>
+            <ol style="margin:0;padding-left:16px;color:var(--text-2);font-size:12px;line-height:1.8">
+              <li>诊断浏览器已打开 — 若页面要求登录，<strong style="color:var(--text-1)">请先完成登录</strong></li>
+              <li>登录成功后，点击下方「<strong style="color:var(--text-1)">重置采集</strong>」清除登录请求，重新开始记录</li>
+              <li>操作出问题的页面，复现异常</li>
+              <li>返回此窗口，点击「<strong style="color:var(--text-1)">采集完成</strong>」</li>
+            </ol>
+          </div>
+
+          <div style="display:flex;gap:8px;margin-bottom:12px">
+            <button class="btn btn-danger btn-sm" id="btn-capture-done" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-stop"/></svg>
+              采集完成
+            </button>
+            <button class="btn btn-secondary btn-sm" id="btn-reset-capture" type="button" title="清除登录期间的请求，重新开始捕获">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+              重置采集
+            </button>
+            <button class="btn btn-ghost btn-sm" id="btn-close-browser" type="button">关闭浏览器</button>
+          </div>
+          <div class="req-table-wrap">
+            <table class="req-table">
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>状态</th>
+                  <th>类型</th>
+                  <th>大小</th>
+                  <th>时间</th>
+                </tr>
+              </thead>
+              <tbody id="req-tbody"></tbody>
+            </table>
+          </div>
+          <div id="capture-empty" class="empty-state">
+            <svg class="icon icon-lg" aria-hidden="true"><use href="#icon-cloud"/></svg>
+            <p>若页面需要登录，请先登录，登录完成后点「重置采集」再操作目标页面</p>
+          </div>
+        </div>
+
+        <!-- 诊断进度 -->
+        <div class="card" id="progress-card" style="display:none">
+          <div class="card-title">
+            <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
+            诊断进度
+          </div>
+          <div class="progress-wrap">
+            <div class="progress-track">
+              <div class="progress-bar" id="progress-bar"></div>
+            </div>
+          </div>
+          <div class="progress-steps" id="progress-steps"></div>
+          <div id="diag-msg" style="margin-top:10px"></div>
+        </div>
+
+        <!-- 诊断结果 -->
+        <div class="card" id="result-card" style="display:none">
+          <div class="card-title">
+            <svg class="icon" aria-hidden="true" style="color:var(--success)"><use href="#icon-check"/></svg>
+            诊断包已生成
+          </div>
+          <div class="result-path-row-container" style="display:flex;gap:6px;align-items:center;">
+            <div class="result-path-row" id="result-path" style="flex:1;">-</div>
+            <button class="btn btn-secondary btn-sm" id="btn-open-dir" type="button" title="打开所在文件夹" style="padding:10px 12px">打开目录</button>
+            <button class="btn btn-secondary btn-sm" id="btn-copy-path" type="button" title="复制文件路径" style="padding:10px 12px">复制</button>
+          </div>
+          <div class="svc-summary" id="result-services"></div>
+          <div style="margin-top:14px;display:flex;justify-content:flex-end">
+            <button class="btn btn-ghost btn-sm" id="btn-new-diag" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+              新建诊断
+            </button>
+          </div>
+        </div>
+      </div><!-- /section-realtime -->
+
+      <!-- 历史模式内容区 -->
+      <div id="section-history" style="display:none">
+        <div class="card">
+          <div class="card-title">
+            <svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg>
+            历史关键词查询
+          </div>
+          <div class="field">
+            <label class="label" for="history-keywords">
+              关键词 / traceId
+              <span id="traceid-badge" style="display:none;margin-left:6px;font-size:10px;padding:1px 7px;border-radius:10px;background:var(--accent-dim);color:var(--accent-txt);font-weight:500">traceId 精确查询</span>
+            </label>
+            <input class="input" type="text" id="history-keywords"
+              placeholder="关键词（如 NullPointerException）或直接粘贴 traceId"
+              autocomplete="off"/>
+            <div class="hint" id="history-kw-hint" style="margin-top:4px">
+              支持：普通关键词（全文搜索）/ traceId（精确 term 查询）/ 混合使用
+            </div>
+          </div>
+          <div class="field-row field-row-2">
+            <div class="field">
+              <label class="label" for="history-start">开始时间</label>
+              <input class="input" type="datetime-local" id="history-start"/>
+            </div>
+            <div class="field">
+              <label class="label" for="history-end">结束时间</label>
+              <input class="input" type="datetime-local" id="history-end"/>
+            </div>
+          </div>
+          <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+            <button class="btn btn-primary btn-sm" id="btn-history-run" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-search"/></svg>
+              查询并打包
+            </button>
+            <button class="btn btn-ghost btn-sm" id="btn-set-wide-range" type="button" title="将时间范围扩展为当天">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-clock"/></svg>
+              扩展为今天
+            </button>
+          </div>
+        </div>
+
+        <div class="card" id="history-progress-card" style="display:none">
+          <div class="card-title">
+            <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
+            历史诊断进度
+          </div>
+          <div class="progress-wrap">
+            <div class="progress-track">
+              <div class="progress-bar" id="history-progress-bar"></div>
+            </div>
+          </div>
+          <div class="progress-steps" id="history-progress-steps"></div>
+          <div id="history-diag-msg" style="margin-top:10px"></div>
+        </div>
+
+        <div class="card" id="history-result-card" style="display:none">
+          <div class="card-title">
+            <svg class="icon" aria-hidden="true" style="color:var(--success)"><use href="#icon-check"/></svg>
+            历史诊断包已生成
+          </div>
+          <div class="result-path-row-container" style="display:flex;gap:6px;align-items:center;">
+            <div class="result-path-row" id="history-result-path" style="flex:1;">-</div>
+            <button class="btn btn-secondary btn-sm" id="btn-open-dir-hist" type="button" title="打开所在文件夹" style="padding:10px 12px">打开目录</button>
+            <button class="btn btn-secondary btn-sm" id="btn-copy-path-hist" type="button" title="复制文件路径" style="padding:10px 12px">复制</button>
+          </div>
+          <div id="history-result-info" style="margin-top:12px;font-size:12px;color:var(--text-2)"></div>
+          <div style="margin-top:14px;display:flex;justify-content:flex-end">
+            <button class="btn btn-ghost btn-sm" id="btn-history-new" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+              新建查询
+            </button>
+          </div>
+        </div>
+      </div><!-- /section-history -->
+
+      <!-- 定时巡检内容区 -->
+      <div id="section-scheduler" style="display:none">
+        <div class="card">
+          <div class="card-title" style="justify-content:space-between">
+            <span style="display:flex;align-items:center;gap:8px">
+              <svg class="icon" aria-hidden="true"><use href="#icon-clock"/></svg>
+              定时巡检
+            </span>
+            <div class="status-row">
+              <span class="status-dot idle" id="scheduler-dot"></span>
+              <span id="scheduler-status-txt" style="font-size:12px;color:var(--text-3)">已停止</span>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;margin-bottom:16px">
+            <button class="btn btn-primary btn-sm" id="btn-start-sched" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-play"/></svg>
+              启动
+            </button>
+            <button class="btn btn-danger btn-sm" id="btn-stop-sched" type="button" disabled>
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-stop"/></svg>
+              停止
+            </button>
+          </div>
+          <div id="sched-pkg-list" class="pkg-list">
+            <div class="empty-state" id="sched-empty">
+              <p>暂无诊断包，启动巡检后自动生成</p>
+            </div>
+          </div>
+        </div>
+      </div><!-- /section-scheduler -->
+
+      <!-- 快速诊断内容区 -->
+      <div id="section-quick" style="display:none">
+        <div class="card">
+          <div class="card-title">
+            <svg class="icon" aria-hidden="true"><use href="#icon-play"/></svg>
+            快速诊断
+          </div>
+          <div class="field">
+            <label class="label" for="quick-trace-id">traceId <span class="required">*</span></label>
+            <input class="input" type="text" id="quick-trace-id"
+              placeholder="从浏览器 Network 面板 x-trace header 中复制"
+              autocomplete="off"/>
+            <span class="hint">例如：08183121b46840b683ee7d9fb308f507</span>
+          </div>
+          <div class="field-row field-row-2" style="margin-top:12px">
+            <div class="field">
+              <label class="label" for="quick-field-traceid">ELK traceId 字段名</label>
+              <input class="input" type="text" id="quick-field-traceid" value="x0" autocomplete="off"/>
+            </div>
+            <div class="field">
+              <label class="label" for="quick-field-message">ELK 消息字段名</label>
+              <input class="input" type="text" id="quick-field-message" value="msg" autocomplete="off"/>
+            </div>
+          </div>
+          <div class="field" style="margin-top:12px">
+            <label class="label" for="quick-index-pattern">索引名称（留空使用配置值）</label>
+            <input class="input" type="text" id="quick-index-pattern" value="iflyhealth-log*" placeholder="iflyhealth-log*" autocomplete="off"/>
+            <span class="hint">实际存储日志的 ES 索引名，如 iflyhealth-log、pcm-java-log 等</span>
+          </div>
+          <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+            <button class="btn btn-primary btn-sm" id="btn-quick-run" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-play"/></svg>
+              开始诊断
+            </button>
+          </div>
+        </div>
+
+        <div class="card" id="quick-progress-card" style="display:none">
+          <div class="card-title">
+            <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
+            快速诊断进度
+          </div>
+          <div class="progress-steps" id="quick-progress-steps"></div>
+        </div>
+
+        <div class="card" id="quick-result-card" style="display:none">
+          <div class="card-title">
+            <svg class="icon" aria-hidden="true" style="color:var(--success)"><use href="#icon-check"/></svg>
+            TXT 诊断包已生成
+          </div>
+          <div class="result-path-row-container" style="display:flex;gap:6px;align-items:center;">
+            <div class="result-path-row" id="quick-result-path" style="flex:1;">-</div>
+            <button class="btn btn-secondary btn-sm" id="btn-open-dir-quick" type="button" title="打开所在文件夹" style="padding:10px 12px">打开目录</button>
+            <button class="btn btn-secondary btn-sm" id="btn-copy-path-quick" type="button" title="复制文件路径" style="padding:10px 12px">复制</button>
+          </div>
+          <div id="quick-result-info" style="margin-top:12px;font-size:12px;color:var(--text-2)"></div>
+          <div style="margin-top:14px;display:flex;justify-content:flex-end">
+            <button class="btn btn-ghost btn-sm" id="btn-quick-new" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+              新建诊断
+            </button>
+          </div>
+        </div>
+      </div><!-- /section-quick -->
+
+    </div><!-- /phase-4 -->
+
+  </main>
+</div><!-- /app-shell -->
+
+<!-- Toast 容器 -->
+<div class="toast-container" id="toast-container"></div>
+
+<script src="app.js"></script>
 </body>
 </html>

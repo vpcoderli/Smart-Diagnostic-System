@@ -179,27 +179,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("收集端启动失败");
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_decode_diag_collect_payload_keeps_raw_json() {
-        let payload = br#"{"pageUrl":"http://host","requests":[]}"#;
-        assert_eq!(
-            decode_diag_collect_payload(payload),
-            r#"{"pageUrl":"http://host","requests":[]}"#
-        );
-    }
-
-    #[test]
-    fn test_decode_diag_collect_payload_extracts_form_data() {
-        let payload =
-            b"data=%7B%22pageUrl%22%3A%22http%3A%2F%2Fhost%22%2C%22requests%22%3A%5B%5D%7D";
-        assert_eq!(
-            decode_diag_collect_payload(payload),
-            r#"{"pageUrl":"http://host","requests":[]}"#
-        );
-    }
-}

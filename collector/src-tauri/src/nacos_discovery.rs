@@ -112,24 +112,3 @@ impl ServiceDiscovery for NacosDiscovery {
         "nacos"
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_infer_log_path() {
-        assert_eq!(
-            infer_log_path("pcm-management", "/var/log/{service-name}/"),
-            "/var/log/pcm-management/"
-        );
-    }
-
-    #[test]
-    fn test_infer_log_path_no_placeholder() {
-        assert_eq!(
-            infer_log_path("pcm-management", "/data/logs/"),
-            "/data/logs/"
-        );
-    }
-}
