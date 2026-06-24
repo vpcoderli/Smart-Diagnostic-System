@@ -1,0 +1,10 @@
+{
+  "identifier": "main-capability",
+  "description": "Main window permissions for Smart Diagnostic Collector",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "dialog:default"
+  ]
+}
