@@ -18,15 +18,37 @@ static GENERIC_SQL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 pub fn extract_sql_from_line(line: &str) -> Option<String> {
     if let Some(cap) = MYBATIS_SQL_REGEX.captures(line) {
-        return Some(cap[1].trim().to_string());
+        return Some(clean_extracted_sql(&cap[1]));
     }
     if let Some(cap) = HIBERNATE_SQL_REGEX.captures(line) {
-        return Some(cap[1].trim().to_string());
+        return Some(clean_extracted_sql(&cap[1]));
     }
     if let Some(mat) = GENERIC_SQL_REGEX.find(line) {
-        return Some(mat.as_str().trim().to_string());
+        return Some(clean_extracted_sql(mat.as_str()));
     }
     None
+}
+
+fn clean_extracted_sql(sql: &str) -> String {
+    let mut sql = sql.trim().to_string();
+    let targets = [
+        "\",\"",
+        "\\\",\\\"",
+        "\",",
+        "\\\",",
+        "\"}",
+        "\\\"}",
+    ];
+    for target in &targets {
+        if let Some(idx) = sql.find(target) {
+            sql.truncate(idx);
+        }
+    }
+    let mut cleaned = sql.trim();
+    while cleaned.ends_with('"') || cleaned.ends_with('\\') {
+        cleaned = &cleaned[..cleaned.len() - 1];
+    }
+    cleaned.trim().to_string()
 }
 
 fn extract_params_from_line(line: &str) -> Option<String> {
