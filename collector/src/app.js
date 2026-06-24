@@ -697,6 +697,7 @@ async function openDiagBrowser() {
     document.getElementById('capture-empty').style.display = 'block';
     document.getElementById('capture-dot').className = 'status-dot testing';
     document.getElementById('capture-indicator').textContent = '诊断浏览器抓包中';
+    document.getElementById('btn-capture-done').disabled = false;
 
     startCountPolling();
     showToast('诊断网页已打开，请重现您遇到的故障', 'info');
@@ -934,6 +935,7 @@ function resetRealtime() {
   document.getElementById('page-url').value = '';
   document.getElementById('req-tbody').innerHTML = '';
   document.getElementById('capture-count').textContent = '0';
+  document.getElementById('btn-capture-done').disabled = false;
   setProgressBar('progress-bar', 0);
 }
 
