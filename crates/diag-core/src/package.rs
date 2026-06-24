@@ -961,9 +961,14 @@ fn parameter_status(trace: &SqlTrace, plans: &[&ExplainPlan]) -> &'static str {
         .as_deref()
         .map(|params| !params.trim().is_empty())
         .unwrap_or(false)
-        || trace_specific_executed_sql(trace, plans).is_some()
     {
         "已拼装"
+    } else if trace_specific_executed_sql(trace, plans).is_some() {
+        if crate::sql_parser::has_unresolved_placeholder(&trace.sql) {
+            "参数缺失 (使用默认值拼装)"
+        } else {
+            "无参数"
+        }
     } else {
         "参数缺失"
     }

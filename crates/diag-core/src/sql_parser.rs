@@ -196,3 +196,103 @@ pub fn parse_mysql_slow_log_entry(block: &str) -> Option<(String, f64, i64, i64)
 
     query_time.map(|qt| (sql, qt * 1000.0, rows_examined, rows_sent))
 }
+
+pub fn has_unresolved_placeholder(sql: &str) -> bool {
+    let mut in_quote = false;
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' {
+            if in_quote && i + 1 < chars.len() && chars[i + 1] == '\'' {
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+        } else if ch == '?' && !in_quote {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+pub fn substitute_dummy_parameters(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut in_quote = false;
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' {
+            if in_quote && i + 1 < chars.len() && chars[i + 1] == '\'' {
+                out.push('\'');
+                out.push('\'');
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        
+        if ch == '?' && !in_quote {
+            let is_limit_or_offset = is_limit_or_offset_context(&chars, i);
+            if is_limit_or_offset {
+                out.push_str("1");
+            } else {
+                out.push_str("'1'");
+            }
+            i += 1;
+            continue;
+        }
+        
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+fn is_limit_or_offset_context(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return false;
+    }
+    let mut pos = index - 1;
+    
+    while pos > 0 {
+        let ch = chars[pos];
+        if ch.is_whitespace() || ch == ',' || ch.is_ascii_digit() || ch == '?' {
+            pos -= 1;
+        } else {
+            break;
+        }
+    }
+    
+    let mut word_chars = Vec::new();
+    while pos > 0 {
+        let ch = chars[pos];
+        if ch.is_alphabetic() {
+            word_chars.push(ch.to_ascii_uppercase());
+            if pos == 0 {
+                break;
+            }
+            pos -= 1;
+        } else {
+            if !ch.is_whitespace() && ch != ',' && ch != '?' && !ch.is_ascii_digit() {
+                break;
+            }
+            break;
+        }
+    }
+    
+    if pos == 0 && chars[0].is_alphabetic() {
+        word_chars.push(chars[0].to_ascii_uppercase());
+    }
+    
+    word_chars.reverse();
+    let word: String = word_chars.into_iter().collect();
+    word == "LIMIT" || word == "OFFSET"
+}
+

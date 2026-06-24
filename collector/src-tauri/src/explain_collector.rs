@@ -439,35 +439,13 @@ fn build_executable_sql(sql: &str, params: Option<&str>) -> String {
 
 fn prepare_explain_sql(sql: &str, params: Option<&str>, db_type: &str) -> Result<String, String> {
     let mut executed = build_executable_sql(sql, params);
-    if has_unresolved_placeholder(&executed) {
-        return Err(
-            "SQL 参数未完整拼装，仍包含 ? 占位符；请检查 Parameters 日志是否被采集到".into(),
-        );
+    if diag_core::sql_parser::has_unresolved_placeholder(&executed) {
+        executed = diag_core::sql_parser::substitute_dummy_parameters(&executed);
     }
     if matches!(db_type, "postgresql" | "postgres") {
         executed = convert_mysql_backticks_for_postgres(&executed);
     }
     Ok(executed)
-}
-
-fn has_unresolved_placeholder(sql: &str) -> bool {
-    let mut in_quote = false;
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '\'' {
-            if in_quote && i + 1 < chars.len() && chars[i + 1] == '\'' {
-                i += 2;
-                continue;
-            }
-            in_quote = !in_quote;
-        } else if ch == '?' && !in_quote {
-            return true;
-        }
-        i += 1;
-    }
-    false
 }
 
 fn convert_mysql_backticks_for_postgres(sql: &str) -> String {
