@@ -206,6 +206,7 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
         .inner_size(1280.0, 900.0)
         .center()
         .initialization_script(DIAGNOSTIC_JS)
+        .devtools(true)
         .build()
         .map_err(|e| format!("创建诊断窗口失败: {}", e))?;
 

@@ -1,0 +1,6 @@
+{
+  "identifier": "diagnostic-capability",
+  "description": "Diagnostic browser window — external URL, no Tauri IPC needed",
+  "windows": ["diagnostic"],
+  "permissions": []
+}
