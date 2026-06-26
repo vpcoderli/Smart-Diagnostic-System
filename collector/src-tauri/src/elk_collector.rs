@@ -47,6 +47,91 @@ fn parse_es_major_version(version_str: &str) -> Option<u8> {
     version_str.split('.').next()?.parse().ok()
 }
 
+/// 构建对字符串字段（traceId / serviceName 等）的健壮精确匹配子句。
+///
+/// ES / Logstash 动态映射下字符串通常索引为 `text`（并带 `.keyword` 子字段），
+/// 直接用 `term` 查 `text` 字段会因分词而匹配不到任何文档——这正是
+/// “连接成功却查不到 traceId 日志” 的根因。这里用 `should` 同时覆盖三种映射：
+/// - keyword 映射：`term` 命中原字段
+/// - text + keyword 子字段：`term` 命中 `<field>.keyword`
+/// - 纯 text 映射：`match_phrase` 命中
+fn string_match_clause(field: &str, value: &str) -> serde_json::Value {
+    serde_json::json!({
+        "bool": {
+            "should": [
+                { "term": { field: value } },
+                { "term": { format!("{}.keyword", field): value } },
+                { "match_phrase": { field: value } }
+            ],
+            "minimum_should_match": 1
+        }
+    })
+}
+
+/// traceId 候选字段：配置映射的 trace_id 字段之外，并入医院侧常见别名。
+/// `x0` 是实际存放 traceId 的字段（与 commands.rs 字段探测一致）。
+fn trace_id_field_candidates(configured: &str) -> Vec<String> {
+    let mut fields = vec![configured.to_string()];
+    for alias in ["x0", "traceId", "trace_id", "tid"] {
+        if !fields.iter().any(|f| f == alias) {
+            fields.push(alias.to_string());
+        }
+    }
+    fields
+}
+
+/// traceId 专用匹配子句。对每个候选字段（配置字段 + `x0` 等别名）都尝试
+/// term / term(.keyword) / match_phrase，再加一条 Kibana 式全文检索（跨所有字段搜原值）。
+/// 这样无论 traceId 存放在配置字段、`x0` 字段、还是内嵌在 `msg` 文本里
+/// （日志正文形如 `... x0=<traceId> ...`），都能命中——等价于在 Kibana 搜索框直接输入该 traceId。
+/// 对不存在的字段，ES 的 term/match_phrase 只是无命中、不会报错。
+fn trace_match_clause(field: &str, value: &str) -> serde_json::Value {
+    let mut should: Vec<serde_json::Value> = Vec::new();
+    for f in trace_id_field_candidates(field) {
+        should.push(serde_json::json!({ "term": { f.clone(): value } }));
+        should.push(serde_json::json!({ "term": { format!("{}.keyword", f): value } }));
+        should.push(serde_json::json!({ "match_phrase": { f: value } }));
+    }
+    // 用引号包裹当作短语，规避 traceId 内点号/冒号被解析成 query_string 运算符
+    should.push(serde_json::json!({
+        "query_string": { "query": format!("\"{}\"", value), "default_operator": "AND" }
+    }));
+    serde_json::json!({
+        "bool": { "should": should, "minimum_should_match": 1 }
+    })
+}
+
+/// 按「配置字段名 + 常见别名」顺序提取字符串字段，返回第一个非空值。
+/// 用于兼容医院侧实际字段名与默认映射不一致的情况（如正文字段是 `msg` 而非 `message`）。
+fn extract_with_aliases<'a>(
+    source: &'a serde_json::Value,
+    configured: &str,
+    aliases: &[&str],
+) -> Option<&'a str> {
+    std::iter::once(configured)
+        .chain(aliases.iter().copied())
+        .filter_map(|key| source.get(key).and_then(|v| v.as_str()))
+        .find(|s| !s.is_empty())
+}
+
+/// 提取 traceId（x-trace）。医院侧已确认 traceId 存放在专用字段 `x0`（其值即 x-trace），
+/// 但 ES 文档里还有一个**内部** `traceId` 字段（点分链路 id，如 `5313...276.178...`，并非 x-trace）。
+/// 必须让 `x0` 优先，否则会取到内部 id，导致后续按 x-trace 关联日志/SQL 全部落空（“未查询到该 traceId 的日志”）。
+/// `x0` 不存在时再回退到配置字段与其它常见别名（对没有 x0 的部署仍然可用）。
+fn extract_trace_id<'a>(source: &'a serde_json::Value, configured: &str) -> Option<&'a str> {
+    extract_with_aliases(source, "x0", &[configured, "traceId", "trace_id", "tid"])
+}
+
+/// 提取服务名。医院侧实际字段为 `app`（如 `pcm-management`），默认映射 `serviceName` 取不到，
+/// 会导致日志全部归到 `services/unknown/`。优先用配置字段，再回退到 `app` 等常见别名。
+fn extract_service<'a>(source: &'a serde_json::Value, configured: &str) -> Option<&'a str> {
+    extract_with_aliases(
+        source,
+        configured,
+        &["app", "serviceName", "service", "application", "appName"],
+    )
+}
+
 impl ElkCollector {
     /// 创建 ElkCollector，自动检测连接模式：
     /// 1. 先尝试直连 ES（GET {address}/）
@@ -139,7 +224,7 @@ impl ElkCollector {
         window: &TimeWindow,
     ) -> serde_json::Value {
         let mut must = vec![
-            serde_json::json!({ "term": { self.config.field_mapping.trace_id.clone(): trace_id } }),
+            trace_match_clause(&self.config.field_mapping.trace_id, trace_id),
         ];
         // 只在 window 非空时才加 range filter，避免空字符串导致 ES 400
         if !window.start.is_empty() && !window.end.is_empty() {
@@ -150,9 +235,7 @@ impl ElkCollector {
             }}));
         }
         if let Some(svc) = service {
-            must.push(
-                serde_json::json!({ "term": { self.config.field_mapping.service.clone(): svc } }),
-            );
+            must.push(string_match_clause(&self.config.field_mapping.service, svc));
         }
         serde_json::json!({
             "query": { "bool": { "must": must } },
@@ -196,10 +279,12 @@ impl ElkCollector {
         })
     }
 
-    /// 按单个 traceId 精确查询（用 term，避免 query_string 对点号的解析问题）
+    /// 按单个 traceId 精确查询。
+    /// 用 string_match_clause 兼容 text/keyword 映射，避免 query_string 对点号的解析问题，
+    /// 同时解决纯 `term` 查不到 text 字段（带 .keyword 子字段）的问题。
     fn build_exact_trace_query(&self, trace_id: &str, window: &TimeWindow) -> serde_json::Value {
         let mut must = vec![
-            serde_json::json!({ "term": { self.config.field_mapping.trace_id.clone(): trace_id } }),
+            trace_match_clause(&self.config.field_mapping.trace_id, trace_id),
         ];
         if !window.start.is_empty() && !window.end.is_empty() {
             must.push(serde_json::json!({ "range": {
@@ -376,14 +461,10 @@ impl ElkCollector {
                         .and_then(|l| l.as_str())
                         .unwrap_or("UNKNOWN")
                         .to_string(),
-                    service: source
-                        .get(&self.config.field_mapping.service)
-                        .and_then(|s| s.as_str())
+                    service: extract_service(source, &self.config.field_mapping.service)
                         .unwrap_or("unknown")
                         .to_string(),
-                    trace_id: source
-                        .get(&self.config.field_mapping.trace_id)
-                        .and_then(|t| t.as_str())
+                    trace_id: extract_trace_id(source, &self.config.field_mapping.trace_id)
                         .map(String::from),
                     thread: source
                         .get(&self.config.field_mapping.thread)
@@ -397,11 +478,11 @@ impl ElkCollector {
                         .get("method")
                         .and_then(|m| m.as_str())
                         .map(String::from),
-                    message: source
-                        .get(&self.config.field_mapping.message)
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+                    message: extract_with_aliases(
+                        source,
+                        &self.config.field_mapping.message,
+                        &["msg", "message", "content", "log_message"],
+                    ).unwrap_or("").to_string(),
                     exception: source
                         .get(&self.config.field_mapping.exception)
                         .and_then(|e| e.as_str())
@@ -483,14 +564,10 @@ impl ElkCollector {
                         .and_then(|l| l.as_str())
                         .unwrap_or("UNKNOWN")
                         .to_string(),
-                    service: source
-                        .get(&field_mapping.service)
-                        .and_then(|s| s.as_str())
+                    service: extract_service(source, &field_mapping.service)
                         .unwrap_or("unknown")
                         .to_string(),
-                    trace_id: source
-                        .get(&field_mapping.trace_id)
-                        .and_then(|t| t.as_str())
+                    trace_id: extract_trace_id(source, &field_mapping.trace_id)
                         .map(String::from),
                     thread: source
                         .get(&field_mapping.thread)
@@ -504,11 +581,11 @@ impl ElkCollector {
                         .get("method")
                         .and_then(|m| m.as_str())
                         .map(String::from),
-                    message: source
-                        .get(&field_mapping.message)
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+                    message: extract_with_aliases(
+                        source,
+                        &field_mapping.message,
+                        &["msg", "message", "content", "log_message"],
+                    ).unwrap_or("").to_string(),
                     exception: source
                         .get(&field_mapping.exception)
                         .and_then(|e| e.as_str())
@@ -563,5 +640,94 @@ impl LogCollector for ElkCollector {
 
     fn source_type(&self) -> &'static str {
         "elk"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_service, extract_trace_id, extract_with_aliases, string_match_clause,
+        trace_match_clause,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn trace_clause_covers_text_keyword_and_phrase() {
+        let clause = string_match_clause("traceId", "abc.123-DEF");
+        let should = clause["bool"]["should"]
+            .as_array()
+            .expect("should 数组");
+        assert_eq!(
+            clause["bool"]["minimum_should_match"], 1,
+            "至少命中一种映射"
+        );
+        // 1) keyword 映射：term 命中原字段
+        assert_eq!(should[0]["term"]["traceId"], "abc.123-DEF");
+        // 2) text + keyword 子字段：term 命中 <field>.keyword（修复“连接成功查不到日志”的关键）
+        assert_eq!(should[1]["term"]["traceId.keyword"], "abc.123-DEF");
+        // 3) 纯 text 映射：match_phrase 兜底
+        assert_eq!(should[2]["match_phrase"]["traceId"], "abc.123-DEF");
+    }
+
+    #[test]
+    fn trace_match_clause_targets_x0_and_full_text() {
+        let value = "08183121b46840b683ee7d9fb308f507";
+        let clause = trace_match_clause("traceId", value);
+        let should = clause["bool"]["should"].as_array().expect("should 数组");
+        assert_eq!(clause["bool"]["minimum_should_match"], 1);
+
+        // 即便字段映射未配置，也直接 term 命中实际存放 traceId 的 `x0` 字段
+        let hits_x0_term = should.iter().any(|c| c["term"]["x0"] == value);
+        assert!(hits_x0_term, "应包含对 x0 字段的 term 匹配");
+        let hits_x0_keyword = should.iter().any(|c| c["term"]["x0.keyword"] == value);
+        assert!(hits_x0_keyword, "应包含对 x0.keyword 的 term 匹配");
+
+        // 仍保留 Kibana 式跨字段全文检索（覆盖 traceId 内嵌在 msg 文本的情况）
+        let has_full_text = should.iter().any(|c| {
+            c["query_string"]["query"] == format!("\"{}\"", value)
+        });
+        assert!(has_full_text, "应包含 query_string 全文检索子句");
+    }
+
+    #[test]
+    fn extract_with_aliases_falls_back_to_msg() {
+        // 配置字段名是默认的 message，但文档里只有 msg —— 应回退取到 msg 内容
+        let source = json!({ "msg": "hello world", "x0": "trace-xyz" });
+        assert_eq!(
+            extract_with_aliases(&source, "message", &["msg", "message", "content"]),
+            Some("hello world")
+        );
+        // traceId 实际在 x0 字段
+        assert_eq!(
+            extract_with_aliases(&source, "traceId", &["x0", "traceId", "tid"]),
+            Some("trace-xyz")
+        );
+        // 都不存在时返回 None
+        assert_eq!(
+            extract_with_aliases(&source, "nope", &["also_nope"]),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_trace_id_prefers_x0_over_decoy_internal_trace() {
+        // 真实医院文档：x0 是 x-trace（要关联的值），另有一个内部 traceId（点分链路 id，并非 x-trace）。
+        // 即使配置字段名是默认的 "traceId"，也必须取 x0，否则按 x-trace 关联日志会全部落空。
+        let source = json!({
+            "traceId": "5313d1e0f8b941a1a605e4d63e9e7ff7.276.17815939022590087",
+            "x0": "ac684dc79d4144adb3214ffee630c055",
+            "app": "pcm-followup",
+            "msg": "RequestUrl:[/v1/pt/all/dict/data]"
+        });
+        assert_eq!(
+            extract_trace_id(&source, "traceId"),
+            Some("ac684dc79d4144adb3214ffee630c055"),
+            "应优先取 x0（x-trace），而非内部点分 traceId"
+        );
+        // 服务名实际在 app 字段，默认映射 serviceName 取不到时回退到 app
+        assert_eq!(extract_service(&source, "serviceName"), Some("pcm-followup"));
+        // 没有 x0 的部署：回退到配置字段
+        let legacy = json!({ "traceId": "plain-trace-1" });
+        assert_eq!(extract_trace_id(&legacy, "traceId"), Some("plain-trace-1"));
     }
 }

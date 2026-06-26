@@ -279,13 +279,23 @@
         </div>
         <div class="source-cards">
           <div class="source-card selected" id="source-elk" role="button" tabindex="0">
+            <span class="source-badge">✓ 已激活</span>
             <div class="source-card-title">
               <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-cloud"/></svg>
               ELK 模式
             </div>
-            <div class="source-card-desc">通过 Elasticsearch 查询日志</div>
+            <div class="source-card-desc">通过 Kibana 代理获取日志</div>
+          </div>
+          <div class="source-card" id="source-es" role="button" tabindex="0">
+            <span class="source-badge">✓ 已激活</span>
+            <div class="source-card-title">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-cloud"/></svg>
+              ES 直接模式
+            </div>
+            <div class="source-card-desc">直接连接 ES 接口获取日志</div>
           </div>
           <div class="source-card" id="source-ssh" role="button" tabindex="0">
+            <span class="source-badge">✓ 已激活</span>
             <div class="source-card-title">
               <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-terminal"/></svg>
               SSH 模式
@@ -338,7 +348,7 @@
               </div>
               <div class="field">
                 <label class="label" for="elk-field-traceid">TraceId 字段</label>
-                <input class="input" type="text" id="elk-field-traceid" value="x0"/>
+                <input class="input" type="text" id="elk-field-traceid" value="traceId"/>
               </div>
               <div class="field">
                 <label class="label" for="elk-field-service">服务名字段</label>
@@ -346,7 +356,65 @@
               </div>
               <div class="field">
                 <label class="label" for="elk-field-message">消息字段</label>
-                <input class="input" type="text" id="elk-field-message" value="msg"/>
+                <input class="input" type="text" id="elk-field-message" value="message"/>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ES 直接配置区 -->
+        <div id="es-config-area" style="display:none">
+          <div class="field-row field-row-2">
+            <div class="field">
+              <label class="label" for="es-address">ES 地址 <span class="required">*</span></label>
+              <input class="input" type="text" id="es-address" placeholder="http://es-host:9200" autocomplete="off"/>
+            </div>
+            <div class="field">
+              <label class="label" for="es-index-pattern">索引模式 <span class="required">*</span></label>
+              <input class="input" type="text" id="es-index-pattern" value="logstash-*" autocomplete="off"/>
+            </div>
+          </div>
+          <div class="field-row field-row-2">
+            <div class="field">
+              <label class="label" for="es-username">用户名</label>
+              <input class="input" type="text" id="es-username" placeholder="elastic（可选）" autocomplete="off"/>
+            </div>
+            <div class="field">
+              <label class="label" for="es-password">密码</label>
+              <div class="input-wrap">
+                <input class="input" type="password" id="es-password" placeholder="（可选）" autocomplete="off"/>
+                <button class="input-eye" id="btn-es-eye" type="button" aria-label="显示/隐藏密码">
+                  <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-eye" id="es-eye-icon"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <button class="adv-toggle" id="es-adv-toggle" type="button" aria-expanded="false">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-chevron-down"/></svg>
+            高级字段映射
+          </button>
+          <div class="adv-content" id="es-adv-content">
+            <div class="field-row field-row-2" style="margin-top:12px">
+              <div class="field">
+                <label class="label" for="es-field-timestamp">时间戳字段</label>
+                <input class="input" type="text" id="es-field-timestamp" value="@timestamp"/>
+              </div>
+              <div class="field">
+                <label class="label" for="es-field-level">日志级别字段</label>
+                <input class="input" type="text" id="es-field-level" value="level"/>
+              </div>
+              <div class="field">
+                <label class="label" for="es-field-traceid">TraceId 字段</label>
+                <input class="input" type="text" id="es-field-traceid" value="traceId"/>
+              </div>
+              <div class="field">
+                <label class="label" for="es-field-service">服务名字段</label>
+                <input class="input" type="text" id="es-field-service" value="serviceName"/>
+              </div>
+              <div class="field">
+                <label class="label" for="es-field-message">消息字段</label>
+                <input class="input" type="text" id="es-field-message" value="message"/>
               </div>
             </div>
           </div>
@@ -391,10 +459,88 @@
         </div>
         <div class="verify-card-body">
           <div class="verify-result" id="elk-verify-result" style="margin-bottom:10px;min-height:16px"></div>
-          <button class="btn btn-secondary btn-sm" id="btn-test-elk" type="button">
-            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
-            测试 ELK 连接
-          </button>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-secondary btn-sm" id="btn-test-elk" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+              测试 ELK 连接
+            </button>
+            <button class="btn btn-secondary btn-sm" id="btn-discover-es" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-search"/></svg>
+              智能探查日志配置
+            </button>
+          </div>
+
+          <!-- ES 智能探查结果面板 -->
+          <div id="es-discover-panel" style="display:none; margin-top:15px; border-top:1px solid var(--border, #30363d); padding-top:12px;">
+            <h4 style="margin:0 0 10px 0; font-size:14px; color:var(--text-1); display:flex; align-items:center; gap:6px;">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-eye"/></svg>
+              ES 智能探查配置报告
+            </h4>
+            <div id="es-discover-fields" style="font-size:12px; color:var(--text-2); line-height:1.8; margin-bottom:10px; padding:10px; background:var(--bg-input, #0d1117); border-radius:4px; border:1px solid var(--border, #30363d);">
+              <!-- 自动检测的映射字段 -->
+            </div>
+            <div id="es-discover-services-container" style="font-size:12px; margin-bottom:12px;">
+              <div style="font-weight:bold; color:var(--text-1); margin-bottom:6px;">📦 自动发现的服务列表 (选择需要应用的配置)：</div>
+              <div id="es-discover-services-list" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:8px; max-height:150px; overflow-y:auto; padding:8px; background:var(--bg-input, #0d1117); border-radius:4px; border:1px solid var(--border, #30363d);">
+                <!-- 服务复选框 -->
+              </div>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-apply-es-config" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-check"/></svg>
+              确认并应用此配置
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ES 连通测试 -->
+      <div class="verify-card" id="es-verify-card" style="display:none">
+        <div class="verify-card-head">
+          <div class="verify-card-info">
+            <div class="verify-card-name">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-cloud"/></svg>
+              ES 直接连通测试
+            </div>
+            <div class="verify-card-addr" id="es-verify-addr">-</div>
+          </div>
+          <div class="status-row" id="es-status-row">
+            <span class="status-dot idle" id="es-status-dot"></span>
+            <span id="es-status-text" style="color:var(--text-3)">等待测试</span>
+          </div>
+        </div>
+        <div class="verify-card-body">
+          <div class="verify-result" id="es-verify-result" style="margin-bottom:10px;min-height:16px"></div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-secondary btn-sm" id="btn-test-es" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-refresh"/></svg>
+              测试 ES 连接
+            </button>
+            <button class="btn btn-secondary btn-sm" id="btn-discover-es-direct" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-search"/></svg>
+              智能探查日志配置
+            </button>
+          </div>
+
+          <!-- ES 直接模式智能探查结果面板 -->
+          <div id="es-discover-panel-direct" style="display:none; margin-top:15px; border-top:1px solid var(--border, #30363d); padding-top:12px;">
+            <h4 style="margin:0 0 10px 0; font-size:14px; color:var(--text-1); display:flex; align-items:center; gap:6px;">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-eye"/></svg>
+              ES 智能探查配置报告
+            </h4>
+            <div id="es-discover-fields-direct" style="font-size:12px; color:var(--text-2); line-height:1.8; margin-bottom:10px; padding:10px; background:var(--bg-input, #0d1117); border-radius:4px; border:1px solid var(--border, #30363d);">
+              <!-- 自动检测 of 映射字段 -->
+            </div>
+            <div id="es-discover-services-container-direct" style="font-size:12px; margin-bottom:12px;">
+              <div style="font-weight:bold; color:var(--text-1); margin-bottom:6px;">📦 自动发现的服务列表 (选择需要应用的配置)：</div>
+              <div id="es-discover-services-list-direct" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:8px; max-height:150px; overflow-y:auto; padding:8px; background:var(--bg-input, #0d1117); border-radius:4px; border:1px solid var(--border, #30363d);">
+                <!-- 服务复选框 -->
+              </div>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-apply-es-config-direct" type="button">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-check"/></svg>
+              确认并应用此配置
+            </button>
+          </div>
         </div>
       </div>
 
@@ -859,21 +1005,7 @@
               autocomplete="off"/>
             <span class="hint">例如：08183121b46840b683ee7d9fb308f507</span>
           </div>
-          <div class="field-row field-row-2" style="margin-top:12px">
-            <div class="field">
-              <label class="label" for="quick-field-traceid">ELK traceId 字段名</label>
-              <input class="input" type="text" id="quick-field-traceid" value="x0" autocomplete="off"/>
-            </div>
-            <div class="field">
-              <label class="label" for="quick-field-message">ELK 消息字段名</label>
-              <input class="input" type="text" id="quick-field-message" value="msg" autocomplete="off"/>
-            </div>
-          </div>
-          <div class="field" style="margin-top:12px">
-            <label class="label" for="quick-index-pattern">索引名称（留空使用配置值）</label>
-            <input class="input" type="text" id="quick-index-pattern" value="iflyhealth-log*" placeholder="iflyhealth-log*" autocomplete="off"/>
-            <span class="hint">实际存储日志的 ES 索引名，如 iflyhealth-log、pcm-java-log 等</span>
-          </div>
+          <!-- 配置信息已迁移至全局配置环节，此处仅保留输入 traceId 的输入框 -->
           <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
             <button class="btn btn-primary btn-sm" id="btn-quick-run" type="button">
               <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-play"/></svg>

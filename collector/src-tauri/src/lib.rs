@@ -6,6 +6,7 @@ mod dedup_cache;
 mod deployment;
 mod diagnosis;
 mod elk_collector;
+mod es_collector;
 mod explain_collector;
 mod nacos_discovery;
 mod scheduler;
@@ -159,10 +160,16 @@ pub fn run() {
             get_config_summary,
             get_desktop_path,
             pick_output_folder,
+            // ES 相关
+            set_es_config,
+            test_es_connection,
             // ELK 相关
             set_elk_config,
             test_elk_connection,
+            discover_log_config_from_es,
             set_schedule_config,
+            // 日志来源选择
+            set_log_source,
             // 调度器
             start_scheduler,
             stop_scheduler,

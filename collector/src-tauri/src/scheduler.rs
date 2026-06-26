@@ -191,8 +191,14 @@ async fn run_scheduled_check(
     config: &CollectorConfig,
     dedup: &mut DedupCache,
 ) -> Result<Option<PackageInfo>> {
-    let schedule = config.schedule.as_ref().unwrap();
-    let elk_config = config.elk.as_ref().unwrap();
+    let schedule = config
+        .schedule
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("定时巡检参数缺失"))?;
+    let elk_config = config
+        .elk
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("定时巡检需要 ELK 配置"))?;
 
     // 1. 计算查询时间窗口
     let now = Utc::now();

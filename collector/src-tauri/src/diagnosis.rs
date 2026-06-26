@@ -98,7 +98,7 @@ impl DiagnosisRunner {
             self.trace_ids.clone()
         };
 
-        // Step 2: 从请求时间戳推算时间窗（前后各加 5 分钟）
+        // Step 2: 从请求时间戳推算时间窗（前后各加 5 分钟）——仅用于 manifest/报告展示
         let window = if let Some(captured) = &self.captured {
             realtime_time_window(captured)
         } else {
@@ -108,10 +108,23 @@ impl DiagnosisRunner {
             })
         };
 
+        // 实时模式：traceId（来自浏览器 x-trace 头）本身唯一，按 traceId 全时间检索，
+        // 与「快速诊断」逻辑完全一致——不再用 ±5min 窗口约束，避免跳板机浏览器与
+        // 应用/ES 服务器之间的时钟偏差把命中的日志挡在窗口外。
+        // 历史模式：仍尊重用户显式指定的时间窗。
+        let query_window = if self.captured.is_some() {
+            TimeWindow {
+                start: String::new(),
+                end: String::new(),
+            }
+        } else {
+            window.clone()
+        };
+
         // Step 3: 通过 LogCollector trait 采集日志
         let all_logs = match self
             .log_collector
-            .query_by_trace_ids(&trace_ids, None, &window)
+            .query_by_trace_ids(&trace_ids, None, &query_window)
             .await
         {
             Ok(entries) => {

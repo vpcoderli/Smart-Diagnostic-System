@@ -64,8 +64,10 @@ Frontends have no build step — `frontendDist` in `tauri.conf.json` points dire
 | `validator.rs` | SSH + DB connectivity validation |
 | `webview_capture.rs` | Opens diagnostic browser with JS injection for HTTP interception |
 | `diagnosis.rs` | `DiagnosisRunner` — orchestrates real-time and historical collection |
-| `elk_collector.rs` | `LogCollector` impl via Elasticsearch (direct or Kibana proxy, auto-detected) |
-| `ssh_log_collector.rs` | `LogCollector` impl via SSH `grep` on remote servers |
+| `elk_collector.rs` | `LogCollector` impl via raw `reqwest` HTTP (direct ES or Kibana proxy, auto-detected); handles ES 6/7/8 query syntax |
+| `es_collector.rs` | `LogCollector` impl via the native `elasticsearch` crate (direct ES connection only) |
+| `ssh_log_collector.rs` | `LogCollector` impl: `grep`s remote log files by traceId (wraps `ssh_collector`) |
+| `ssh_collector.rs` | Low-level SSH primitives (`ssh_exec`, `grep_remote_logs`) over `russh`; password + key auth. Also used by `validator.rs` |
 | `nacos_discovery.rs` | `ServiceDiscovery` impl querying Nacos registry |
 | `sql_extractor.rs` | Extracts SQL from log lines (MyBatis/Hibernate/generic patterns) |
 | `explain_collector.rs` | Runs `EXPLAIN` on slow SQLs (MySQL + PostgreSQL) |
@@ -83,11 +85,12 @@ Frontends have no build step — `frontendDist` in `tauri.conf.json` points dire
 
 ### Log Collection Strategy
 
-The collector supports two pluggable `LogCollector` backends:
-- **ELK** (`elk_collector.rs`): auto-detects direct ES vs. Kibana proxy mode; supports ES 6.x/7.x/8.x query syntax differences
-- **SSH** (`ssh_log_collector.rs`): SSHes into app servers, `grep`s log files by traceId
+The collector supports three pluggable `LogCollector` backends, selected by `log_source` (frontend `state.logSource`):
+- **`'elk'`** (`elk_collector.rs`): raw `reqwest` HTTP; auto-detects direct ES vs. Kibana proxy mode; supports ES 6.x/7.x/8.x query syntax differences. The default when `log_source` is unset.
+- **`'es'`** (`es_collector.rs`): native `elasticsearch` crate against a direct ES endpoint only (no Kibana proxy). Requires `config.es` (`EsConfig`).
+- **`'ssh'`** (`ssh_log_collector.rs` → `ssh_collector.rs`): SSHes into app servers and `grep`s log files by traceId.
 
-Frontend `state.logSource` = `'elk' | 'ssh'` selects which backend to use.
+Backend selection happens in `commands.rs` (`match source.as_str()`), which boxes the chosen impl as `Box<dyn LogCollector>`.
 
 ### Key Data Flow
 

@@ -1,5 +1,4 @@
 use chrono::{DateTime, Duration, FixedOffset, Utc};
-use diag_core::collector_trait::LogCollector;
 use diag_core::config::CollectorConfig;
 use diag_core::models::{CapturedPage, LogEntry, ResolvedUrl};
 use diag_core::url_resolver;
@@ -18,6 +17,20 @@ pub struct AppState {
     pub validated: Mutex<bool>,
     pub scheduler_status: Arc<std::sync::Mutex<crate::scheduler::SchedulerStatus>>,
     pub scheduler_handle: Mutex<Option<crate::scheduler::SchedulerHandle>>,
+}
+
+/// 日志源 × 诊断模式 的支持矩阵（唯一事实来源）。
+///
+/// - `realtime`：抓包后按 traceId 取日志，三种源都支持（ELK 还可降级 SSH）。
+/// - `history` / `quick`：依赖 ELK/ES 的全文与 traceId 检索，SSH 暂不支持。
+/// - `scheduler`：按关键词轮询，目前仅 ELK。
+pub fn source_supports_mode(source: &str, mode: &str) -> bool {
+    match mode {
+        "realtime" => matches!(source, "elk" | "es" | "ssh"),
+        "history" | "quick" => matches!(source, "elk" | "es"),
+        "scheduler" => source == "elk",
+        _ => false,
+    }
 }
 
 // ═══════════════════════════════════════
@@ -111,7 +124,9 @@ pub fn import_service_csv(
             services: Vec::new(),
             databases: Vec::new(),
             elk: None,
+            es: None,
             schedule: None,
+            log_source: None,
         });
     }
     if let Some(ref mut m) = *manifest {
@@ -157,7 +172,9 @@ pub fn import_db_csv(
             services: Vec::new(),
             databases: Vec::new(),
             elk: None,
+            es: None,
             schedule: None,
+            log_source: None,
         });
     }
     if let Some(ref mut m) = *manifest {
@@ -199,7 +216,9 @@ pub fn set_site_info(
             services: Vec::new(),
             databases: Vec::new(),
             elk: None,
+            es: None,
             schedule: None,
+            log_source: None,
         });
         return Ok(format!("站点信息已初始化: {}", site_name));
     }
@@ -660,8 +679,39 @@ fn build_elk_config_from_manifest(
                 .field_service
                 .clone()
                 .unwrap_or_else(|| "serviceName".into()),
-            trace_id: e.field_trace_id.clone().unwrap_or_else(|| "x0".into()),
-            message: e.field_message.clone().unwrap_or_else(|| "msg".into()),
+            trace_id: e.field_trace_id.clone().unwrap_or_else(|| "traceId".into()),
+            message: e.field_message.clone().unwrap_or_else(|| "message".into()),
+            exception: "exception".into(),
+            stack_trace: "stackTrace".into(),
+            thread: "thread".into(),
+        },
+    })
+}
+
+/// 实时模式：从 manifest 最新 ES 配置构建 EsConfig，保证字段映射与快速诊断一致
+fn build_es_config_from_manifest(
+    manifest: &crate::deployment::DeploymentManifest,
+) -> Option<diag_core::config::EsConfig> {
+    use diag_core::config::{EsConfig, FieldMapping};
+    manifest.es.as_ref().map(|e| EsConfig {
+        address: e.address.clone(),
+        index_pattern: e.index_pattern.clone(),
+        username: e.username.clone(),
+        password: e.password.clone(),
+        timeout_secs: e.timeout_secs.unwrap_or(30),
+        max_hits_per_trace: e.max_hits_per_trace.unwrap_or(2000),
+        field_mapping: FieldMapping {
+            timestamp: e
+                .field_timestamp
+                .clone()
+                .unwrap_or_else(|| "@timestamp".into()),
+            level: e.field_level.clone().unwrap_or_else(|| "level".into()),
+            service: e
+                .field_service
+                .clone()
+                .unwrap_or_else(|| "serviceName".into()),
+            trace_id: e.field_trace_id.clone().unwrap_or_else(|| "traceId".into()),
+            message: e.field_message.clone().unwrap_or_else(|| "message".into()), // ES 默认字段
             exception: "exception".into(),
             stack_trace: "stackTrace".into(),
             thread: "thread".into(),
@@ -720,6 +770,7 @@ fn filter_logs_by_text_terms(logs: Vec<LogEntry>, terms: &[&str]) -> Vec<LogEntr
 #[tauri::command]
 pub async fn start_diagnosis(
     captured_json: String,
+    log_source: Option<String>,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
@@ -735,17 +786,15 @@ pub async fn start_diagnosis(
             .clone()
     };
 
-    // 从 manifest 读取最新 ELK 配置，覆盖 config.elk（避免旧 config 中 index_pattern 缺通配符等问题）
+    // 从 manifest 读取最新 ELK 和 ES 配置，分别覆盖 config
     {
         let manifest = state.manifest.lock().unwrap();
         if let Some(ref m) = *manifest {
             if let Some(elk_cfg) = build_elk_config_from_manifest(m) {
-                tracing::info!(
-                    "[实时诊断] 从 manifest 刷新 ELK 配置: index={}, trace_id_field={}",
-                    elk_cfg.index_pattern,
-                    elk_cfg.field_mapping.trace_id
-                );
                 config.elk = Some(elk_cfg);
+            }
+            if let Some(es_cfg) = build_es_config_from_manifest(m) {
+                config.es = Some(es_cfg);
             }
         }
     }
@@ -764,43 +813,63 @@ pub async fn start_diagnosis(
         .into_iter()
         .collect();
 
+    let source = log_source.unwrap_or_else(|| "elk".to_string());
     tracing::info!(
-        "启动诊断: 页面={}, 请求数={}, 站点={}",
+        "启动诊断: 页面={}, 请求数={}, 站点={}, 日志源={}",
         captured.page_url,
         captured.requests.len(),
-        config.site.name
+        config.site.name,
+        source
     );
 
-    // 优先使用 ELK，不可用时降级到 SSH
-    let log_collector: Box<dyn diag_core::collector_trait::LogCollector> =
-        if let Some(elk_cfg) = &config.elk {
-            match crate::elk_collector::ElkCollector::new(elk_cfg.clone()).await {
-                Ok(elk) => {
-                    tracing::info!("使用 ELK 采集日志");
-                    Box::new(elk)
-                }
-                Err(e) => {
-                    if has_ssh_fallback_config(&config) {
-                        tracing::warn!("ELK 不可用 ({}), 降级 SSH", e);
-                        Box::new(SshLogCollector::new(
-                            config.ssh.clone(),
-                            config.services.clone(),
-                            config.collector.max_log_lines,
-                        ))
-                    } else {
-                        return Err(format!("ELK 初始化失败，且未配置可用 SSH 降级: {}", e));
+    let log_collector: Box<dyn diag_core::collector_trait::LogCollector> = match source.as_str() {
+        "es" => {
+            if let Some(es_cfg) = &config.es {
+                Box::new(crate::es_collector::EsCollector::new(es_cfg.clone()).await
+                    .map_err(|e| format!("ES 初始化失败: {}", e))?)
+            } else {
+                return Err("未配置 ES 直接连接信息".to_string());
+            }
+        }
+        "elk" => {
+            if let Some(elk_cfg) = &config.elk {
+                match crate::elk_collector::ElkCollector::new(elk_cfg.clone()).await {
+                    Ok(elk) => Box::new(elk),
+                    Err(e) => {
+                        if has_ssh_fallback_config(&config) {
+                            tracing::warn!("ELK 不可用 ({}), 降级 SSH", e);
+                            Box::new(SshLogCollector::new(
+                                config.ssh.clone(),
+                                config.services.clone(),
+                                config.collector.max_log_lines,
+                            ))
+                        } else {
+                            return Err(format!("ELK 初始化失败，且未配置可用 SSH 降级: {}", e));
+                        }
                     }
                 }
+            } else if has_ssh_fallback_config(&config) {
+                Box::new(SshLogCollector::new(
+                    config.ssh.clone(),
+                    config.services.clone(),
+                    config.collector.max_log_lines,
+                ))
+            } else {
+                return Err("未配置 ELK，且未配置可用 SSH 日志采集".to_string());
             }
-        } else if has_ssh_fallback_config(&config) {
-            Box::new(SshLogCollector::new(
-                config.ssh.clone(),
-                config.services.clone(),
-                config.collector.max_log_lines,
-            ))
-        } else {
-            return Err("未配置 ELK，且未配置可用 SSH 日志采集".to_string());
-        };
+        }
+        "ssh" | _ => {
+            if has_ssh_fallback_config(&config) {
+                Box::new(SshLogCollector::new(
+                    config.ssh.clone(),
+                    config.services.clone(),
+                    config.collector.max_log_lines,
+                ))
+            } else {
+                return Err("未配置可用 SSH 日志采集".to_string());
+            }
+        }
+    };
 
     let runner = DiagnosisRunner::new(config, captured, log_collector);
     match runner.run().await {
@@ -863,6 +932,96 @@ pub async fn pick_output_folder(app: tauri::AppHandle) -> Result<Option<String>,
 }
 
 // ═══════════════════════════════════════
+// ES 相关命令
+// ═══════════════════════════════════════
+
+/// 设置 ES 配置
+#[tauri::command]
+pub fn set_es_config(
+    es: crate::deployment::EsDeployment,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut manifest = state.manifest.lock().unwrap();
+    if let Some(ref mut m) = *manifest {
+        m.es = Some(es);
+        let config = crate::deployment::manifest_to_collector_config(m);
+        *state.config.lock().unwrap() = Some(config);
+        Ok("ES 配置已设置".to_string())
+    } else {
+        // 保留已有 ELK 配置，新建时 elk 为空
+        let manifest_new = crate::deployment::DeploymentManifest {
+            site_name: String::new(),
+            system: "pcm".to_string(),
+            gateway_prefix: "/gateway".to_string(),
+            services: Vec::new(),
+            databases: Vec::new(),
+            elk: None, // 新建时 ELK 为空，不影响已存在 manifest 分支
+            es: Some(es),
+            schedule: None,
+            log_source: None,
+        };
+        let config = crate::deployment::manifest_to_collector_config(&manifest_new);
+        *manifest = Some(manifest_new);
+        *state.config.lock().unwrap() = Some(config);
+        Ok("ES 配置已设置（新建配置）".to_string())
+    }
+}
+
+/// 测试 ES 直接连接
+#[tauri::command]
+pub async fn test_es_connection(
+    address: String,
+    index_pattern: String,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<serde_json::Value, String> {
+    use diag_core::config::{EsConfig, FieldMapping};
+
+    let config = EsConfig {
+        address,
+        index_pattern,
+        username,
+        password,
+        timeout_secs: 10,
+        max_hits_per_trace: 1,
+        field_mapping: FieldMapping::default(),
+    };
+
+    match crate::es_collector::EsCollector::new(config).await {
+        Ok(collector) => {
+            match collector.get_es_version().await {
+                Ok(version) => Ok(serde_json::json!({
+                    "success": true,
+                    "message": "ES 连接成功",
+                    "esVersion": version,
+                })),
+                Err(e) => Err(format!("ES 校验请求失败: {}", e)),
+            }
+        }
+        Err(e) => Err(format!("ES 客户端初始化失败: {}", e)),
+    }
+}
+
+// ═══════════════════════════════════════
+// 日志来源选择持久化
+// ═══════════════════════════════════════
+
+/// 持久化保存当前选择的日志来源（elk / es / ssh）
+#[tauri::command]
+pub fn set_log_source(
+    log_source: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut manifest = state.manifest.lock().unwrap();
+    if let Some(ref mut m) = *manifest {
+        m.log_source = Some(log_source.clone());
+        Ok(format!("日志来源已设置为 {}", log_source))
+    } else {
+        Err("尚未初始化配置，请先完成第一步配置".to_string())
+    }
+}
+
+// ═══════════════════════════════════════
 // ELK 相关命令
 // ═══════════════════════════════════════
 
@@ -875,18 +1034,26 @@ pub fn set_elk_config(
     let mut manifest = state.manifest.lock().unwrap();
     if let Some(ref mut m) = *manifest {
         m.elk = Some(elk);
+        // 同步更新 state.config，与 set_es_config 对称
+        let config = crate::deployment::manifest_to_collector_config(m);
+        *state.config.lock().unwrap() = Some(config);
         Ok("ELK 配置已设置".to_string())
     } else {
-        // 允许在没有服务配置时也能设置 ELK
-        *manifest = Some(crate::deployment::DeploymentManifest {
+        // 新建 manifest 时保留 es: None（没有旧的 manifest 就没有 ES 配置）
+        let manifest_new = crate::deployment::DeploymentManifest {
             site_name: String::new(),
             system: "pcm".to_string(),
             gateway_prefix: "/gateway".to_string(),
             services: Vec::new(),
             databases: Vec::new(),
             elk: Some(elk),
+            es: None,
             schedule: None,
-        });
+            log_source: None,
+        };
+        let config = crate::deployment::manifest_to_collector_config(&manifest_new);
+        *manifest = Some(manifest_new);
+        *state.config.lock().unwrap() = Some(config);
         Ok("ELK 配置已设置（新建配置）".to_string())
     }
 }
@@ -920,6 +1087,210 @@ pub async fn test_elk_connection(
         })),
         Err(e) => Err(format!("ELK 连接失败: {}", e)),
     }
+}
+
+/// 启发式推断日志字段映射
+fn guess_fields(mapping_json: &serde_json::Value) -> diag_core::config::FieldMapping {
+    let mut mapping = diag_core::config::FieldMapping::default();
+
+    if let Some(obj) = mapping_json.as_object() {
+        for (_index, val) in obj {
+            if let Some(properties) = val.get("mappings").and_then(|m| m.get("properties")).and_then(|p| p.as_object()) {
+                for (field_name, field_def) in properties {
+                    let field_type = field_def.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let name_lower = field_name.to_lowercase();
+
+                    // 1. Timestamp (type is date)
+                    if field_type == "date" {
+                        if name_lower.contains("time") || name_lower.contains("date") || field_name == "@timestamp" {
+                            mapping.timestamp = field_name.clone();
+                        }
+                    }
+
+                    // 2. Level
+                    if name_lower == "level" || name_lower == "loglevel" || name_lower == "log.level" || name_lower == "severity" {
+                        mapping.level = field_name.clone();
+                    }
+
+                    // 3. TraceId
+                    if name_lower == "traceid" || name_lower == "trace_id" || name_lower == "x0" || name_lower == "tid" {
+                        mapping.trace_id = field_name.clone();
+                    }
+
+                    // 4. Service
+                    if name_lower == "servicename" || name_lower == "service_name" || name_lower == "service" || name_lower == "app" || name_lower == "appname" {
+                        if field_type == "keyword" {
+                            mapping.service = field_name.clone();
+                        } else if field_def.get("fields").and_then(|f| f.get("keyword")).is_some() {
+                            mapping.service = format!("{}.keyword", field_name);
+                        } else {
+                            mapping.service = field_name.clone();
+                        }
+                    }
+
+                    // 5. Message
+                    if name_lower == "message" || name_lower == "msg" || name_lower == "content" || name_lower == "log_message" {
+                        mapping.message = field_name.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    mapping
+}
+
+/// 智能从 ES 探查日志配置（索引映射 + 活跃微服务）
+#[tauri::command]
+pub async fn discover_log_config_from_es(
+    address: String,
+    index_pattern: String,
+    username: Option<String>,
+    password: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    use elasticsearch::{Elasticsearch, SearchParts};
+    use elasticsearch::indices::IndicesGetMappingParts;
+    use elasticsearch::http::transport::{TransportBuilder, SingleNodeConnectionPool};
+    use elasticsearch::auth::Credentials;
+    use elasticsearch::cert::CertificateValidation;
+    use url::Url;
+    use serde_json::json;
+
+    tracing::info!("开始从 ES 智能探查日志配置: address={}, index_pattern={}", address, index_pattern);
+
+    let url_parsed = Url::parse(&address).map_err(|e| format!("无效的 ES 地址: {}", e))?;
+    let conn_pool = SingleNodeConnectionPool::new(url_parsed);
+    let mut builder = TransportBuilder::new(conn_pool);
+    if let (Some(u), Some(p)) = (&username, &password) {
+        if !u.trim().is_empty() {
+            builder = builder.auth(Credentials::Basic(u.clone(), p.clone()));
+        }
+    }
+    builder = builder.cert_validation(CertificateValidation::None);
+    let transport = builder.build().map_err(|e| format!("构建 ES Transport 失败: {}", e))?;
+    let client = Elasticsearch::new(transport);
+
+    // 1. 获取 Mapping
+    tracing::info!("发送 ES Mapping 请求...");
+    let mapping_resp = client
+        .indices()
+        .get_mapping(IndicesGetMappingParts::Index(&[&index_pattern]))
+        .send()
+        .await
+        .map_err(|e| format!("获取 ES Mapping 失败: {}", e))?;
+
+    let mapping_body = mapping_resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("解析 Mapping JSON 失败: {}", e))?;
+
+    tracing::info!("ES Mapping 返回成功，开始推断字段映射...");
+    let guessed_mapping = guess_fields(&mapping_body);
+    tracing::info!("推断字段映射结果: {:?}", guessed_mapping);
+
+    // 2. 利用推论出的服务名（如果有），做 Terms 聚合获取活跃服务名列表
+    let service_field = guessed_mapping.service.clone();
+    tracing::info!("使用服务名域 '{}' 进行 Terms 聚合查询...", service_field);
+
+    let agg_query = json!({
+        "size": 0,
+        "aggs": {
+            "unique_services": {
+                "terms": {
+                    "field": service_field,
+                    "size": 100
+                }
+            }
+        }
+    });
+
+    let search_resp = client
+        .search(SearchParts::Index(&[&index_pattern]))
+        .body(agg_query)
+        .send()
+        .await
+        .map_err(|e| format!("ES 聚合查询服务名失败: {}", e))?;
+
+    let search_body = search_resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("解析聚合响应 JSON 失败: {}", e))?;
+
+    let mut services = Vec::new();
+    if let Some(buckets) = search_body.get("aggregations")
+        .and_then(|a| a.get("unique_services"))
+        .and_then(|u| u.get("buckets"))
+        .and_then(|b| b.as_array()) {
+        for bucket in buckets {
+            if let Some(key) = bucket.get("key").and_then(|k| k.as_str()) {
+                services.push(key.to_string());
+            }
+        }
+    }
+
+    tracing::info!("从 ES 探查成功，共发现服务 {} 个: {:?}", services.len(), services);
+
+    // 3. 将发现的服务写入 Manifest，以便后续流程无需手动导入 CSV
+    let mut manifest = state.manifest.lock().unwrap();
+    if let Some(ref mut m) = *manifest {
+        // 创建或更新微服务配置
+        let mut new_services = m.services.clone();
+        for svc_name in &services {
+            if !new_services.iter().any(|s| s.project_name == *svc_name) {
+                new_services.push(crate::deployment::ServiceDeployment {
+                    project_name: svc_name.clone(),
+                    server_ip: "elk".to_string(), // ES 模式下设为占位符
+                    ssh_username: String::new(),
+                    ssh_password: String::new(),
+                    ssh_port: 22,
+                    log_path: String::new(),
+                    log_pattern: String::new(),
+                });
+            }
+        }
+        m.services = new_services;
+    } else {
+        // 新建 manifest 并填入服务
+        let s_deployments = services.iter().map(|svc_name| crate::deployment::ServiceDeployment {
+            project_name: svc_name.clone(),
+            server_ip: "elk".to_string(),
+            ssh_username: String::new(),
+            ssh_password: String::new(),
+            ssh_port: 22,
+            log_path: String::new(),
+            log_pattern: String::new(),
+        }).collect();
+        *manifest = Some(crate::deployment::DeploymentManifest {
+            site_name: String::new(),
+            system: "pcm".to_string(),
+            gateway_prefix: "/gateway".to_string(),
+            services: s_deployments,
+            databases: Vec::new(),
+            elk: None,
+            es: None,
+            schedule: None,
+            log_source: None,
+        });
+    }
+
+    // 刷新 AppState::config
+    if let Some(ref m) = *manifest {
+        let config = crate::deployment::manifest_to_collector_config(m);
+        *state.config.lock().unwrap() = Some(config);
+    }
+
+    Ok(json!({
+        "success": true,
+        "fieldMapping": {
+            "timestamp": guessed_mapping.timestamp,
+            "level": guessed_mapping.level,
+            "traceId": guessed_mapping.trace_id,
+            "service": guessed_mapping.service,
+            "message": guessed_mapping.message,
+        },
+        "services": services,
+    }))
 }
 
 /// 设置定时任务配置
@@ -975,6 +1346,14 @@ pub async fn start_scheduler(
         }
     }
 
+    // 定时巡检按关键词轮询 ELK，目前仅支持 ELK 日志源。
+    if config.elk.is_none() {
+        return Err("定时巡检目前仅支持 ELK 日志源，请先在 Configure 页面配置 ELK 地址".to_string());
+    }
+    if config.schedule.is_none() {
+        return Err("尚未配置定时巡检参数，请在第一步开启并填写巡检配置".to_string());
+    }
+
     resolve_output_dir(&app, &mut config);
 
     let handle = crate::scheduler::start(app, config, state.scheduler_status.clone())
@@ -1008,13 +1387,12 @@ pub fn get_scheduler_status(state: State<'_, AppState>) -> crate::scheduler::Sch
     state.scheduler_status.lock().unwrap().clone()
 }
 
-/// 启动历史模式诊断（按关键词 / traceId 直查 + 时间窗口）
-/// keywords 中若某项看起来像 traceId（含点号的 hex 字符串），自动切换为 term 精确查询
 #[tauri::command]
 pub async fn start_historical_diagnosis(
     keywords: Vec<String>,
     time_start: String,
     time_end: String,
+    log_source: Option<String>,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
@@ -1036,7 +1414,7 @@ pub async fn start_historical_diagnosis(
         cfg.as_ref().ok_or("请先完成配置")?.clone()
     };
 
-    // 从 manifest 读取最新 ELK 配置，与实时/快速模式保持一致
+    // 从 manifest 读取最新 ELK 和 ES 配置，与实时/快速模式保持一致
     {
         let manifest = state.manifest.lock().unwrap();
         if let Some(ref m) = *manifest {
@@ -1048,49 +1426,95 @@ pub async fn start_historical_diagnosis(
                 );
                 config.elk = Some(elk_cfg);
             }
+            if let Some(es_cfg) = build_es_config_from_manifest(m) {
+                tracing::info!(
+                    "[历史诊断] 从 manifest 刷新 ES 配置: index={}, trace_id_field={}",
+                    es_cfg.index_pattern,
+                    es_cfg.field_mapping.trace_id
+                );
+                config.es = Some(es_cfg);
+            }
         }
     }
 
     resolve_output_dir(&app, &mut config);
 
-    if config.elk.is_none() {
+    let source = log_source.unwrap_or_else(|| "elk".to_string());
+
+    // 历史诊断依赖关键词全文检索，仅支持 ELK / ES；SSH 等其它源直接拒绝，避免落到 elk.unwrap() 崩溃。
+    if !source_supports_mode(&source, "history") {
+        return Err(format!(
+            "历史诊断模式暂不支持「{}」日志源，请切换为 ELK 或 ES",
+            source
+        ));
+    }
+    if source == "elk" && config.elk.is_none() {
         return Err("历史模式需要 ELK 配置，请在 Configure 页面填写 ELK 地址".to_string());
     }
+    if source == "es" && config.es.is_none() {
+        return Err("历史模式需要 ES 配置，请在 Configure 页面填写 ES 地址".to_string());
+    }
 
-    let elk_config = config.elk.as_ref().unwrap().clone();
     let window = diag_core::models::TimeWindow {
         start: time_start.clone(),
         end: time_end.clone(),
     };
 
-    // ── Step 1：连接 ELK ──
+    // ── Step 1：连接 ELK/ES ──
     emit_step(
         &app,
         "elk-connect",
-        &format!("正在连接 ELK：{}", elk_config.address),
+        &format!("正在连接 {}...", if source == "es" { "ES" } else { "ELK" }),
         "running",
     );
 
-    let elk_collector = crate::elk_collector::ElkCollector::new(elk_config.clone())
-        .await
-        .map_err(|e| {
+    let log_collector: Box<dyn diag_core::collector_trait::LogCollector> = match source.as_str() {
+        "es" => {
+            let es_config = config.es.as_ref().ok_or("历史模式需要 ES 配置")?.clone();
+            let es_collector = crate::es_collector::EsCollector::new(es_config)
+                .await
+                .map_err(|e| {
+                    emit_step(
+                        &app,
+                        "elk-connect",
+                        &format!("ES 连接失败：{}", e),
+                        "error",
+                    );
+                    format!("ES 连接失败: {}", e)
+                })?;
             emit_step(
                 &app,
                 "elk-connect",
-                &format!("ELK 连接失败：{}", e),
-                "error",
+                "ES 连接成功",
+                "done",
             );
-            format!("ELK 连接失败: {}", e)
-        })?;
-    emit_step(
-        &app,
-        "elk-connect",
-        &format!(
-            "ELK 连接成功（ES 版本 {}）",
-            elk_collector.es_major_version()
-        ),
-        "done",
-    );
+            Box::new(es_collector)
+        }
+        _ => {
+            let elk_config = config.elk.as_ref().ok_or("历史模式需要 ELK 配置")?.clone();
+            let elk_collector = crate::elk_collector::ElkCollector::new(elk_config.clone())
+                .await
+                .map_err(|e| {
+                    emit_step(
+                        &app,
+                        "elk-connect",
+                        &format!("ELK 连接失败：{}", e),
+                        "error",
+                    );
+                    format!("ELK 连接失败: {}", e)
+                })?;
+            emit_step(
+                &app,
+                "elk-connect",
+                &format!(
+                    "ELK 连接成功（ES 版本 {}）",
+                    elk_collector.es_major_version()
+                ),
+                "done",
+            );
+            Box::new(elk_collector)
+        }
+    };
 
     // ── Step 2：查询关键词日志 ──
     let kw_display = if keywords.is_empty() {
@@ -1136,8 +1560,8 @@ pub async fn start_historical_diagnosis(
             &query_detail,
             "running",
         );
-        let trace_logs = elk_collector
-            .query_by_exact_trace_ids(&tids, &window)
+        let trace_logs = log_collector
+            .query_by_trace_ids(&tids, None, &window)
             .await
             .map_err(|e| {
                 emit_step(
@@ -1146,7 +1570,7 @@ pub async fn start_historical_diagnosis(
                     &format!("traceId 查询失败：{}", e),
                     "error",
                 );
-                format!("ELK 查询失败: {}", e)
+                format!("查询失败: {}", e)
             })?;
 
         if text_keys.is_empty() {
@@ -1157,12 +1581,12 @@ pub async fn start_historical_diagnosis(
     } else {
         // 普通关键词全文搜索
         let text_keywords: Vec<String> = text_keys.iter().map(|s| s.to_string()).collect();
-        elk_collector
+        log_collector
             .query_by_keywords(&text_keywords, None, &window)
             .await
             .map_err(|e| {
-                emit_step(&app, "elk-query", &format!("ELK 查询失败：{}", e), "error");
-                format!("ELK 查询失败: {}", e)
+                emit_step(&app, "elk-query", &format!("查询失败：{}", e), "error");
+                format!("查询失败: {}", e)
             })?
     };
 
@@ -1246,16 +1670,11 @@ pub async fn start_historical_diagnosis(
         &app,
         "collect-logs",
         &format!(
-            "按 {} 个 traceId 从 ELK 采集完整链路日志...",
-            trace_ids.len()
+            "按 {} 个 traceId 从 {} 采集完整链路日志...",
+            trace_ids.len(),
+            if source == "es" { "ES" } else { "ELK" }
         ),
         "running",
-    );
-
-    let log_collector: Box<dyn diag_core::collector_trait::LogCollector> = Box::new(
-        crate::elk_collector::ElkCollector::new(elk_config)
-            .await
-            .map_err(|e| format!("ELK 初始化失败: {}", e))?,
     );
 
     // DiagnosisRunner 内部会采集完整链路 + SQL + 打包
@@ -1270,7 +1689,10 @@ pub async fn start_historical_diagnosis(
     emit_step(
         &app,
         "collect-logs",
-        "traceId 关联日志采集中（ELK 并发查询）...",
+        &format!(
+            "traceId 关联日志采集中（{} 并发查询）...",
+            if source == "es" { "ES" } else { "ELK" }
+        ),
         "running",
     );
 
@@ -1399,7 +1821,7 @@ pub fn clear_saved_config(
 // 快速诊断模式
 // ═══════════════════════════════════════
 
-/// 快速诊断：输入单个 traceId，直接从 ELK 查询日志并输出 TXT 格式 ZIP
+/// 快速诊断：输入单个 traceId，直接从 ELK/ES 查询日志并输出 TXT 格式 ZIP
 #[tauri::command]
 pub async fn start_quick_diagnosis(
     trace_id: String,
@@ -1407,17 +1829,19 @@ pub async fn start_quick_diagnosis(
     field_message: Option<String>,
     index_pattern: Option<String>,
     output_dir: Option<String>,
+    log_source: Option<String>,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
-    use diag_core::config::{ElkConfig, FieldMapping};
+    use diag_core::config::{FieldMapping};
 
     // 设置 panic hook 以便在崩溃时记录更多信息
     tracing::info!(
-        "快速诊断启动: trace_id={}, field_trace_id={:?}, field_message={:?}",
+        "快速诊断启动: trace_id={}, field_trace_id={:?}, field_message={:?}, log_source={:?}",
         trace_id,
         field_trace_id,
-        field_message
+        field_message,
+        log_source
     );
     tracing::info!("快速诊断 — 各阶段开始前打日志以定位闪退位置");
 
@@ -1436,17 +1860,6 @@ pub async fn start_quick_diagnosis(
     if trace_id.trim().is_empty() {
         return Err("请输入 traceId".to_string());
     }
-
-    // 读取 ELK 配置（从 manifest 的 ElkDeployment 转换）
-    let elk_deployment = {
-        let manifest = state.manifest.lock().unwrap();
-        let manifest = manifest.as_ref().ok_or("请先配置 ELK 信息")?;
-        manifest
-            .elk
-            .as_ref()
-            .ok_or("快速诊断需要 ELK 配置")?
-            .clone()
-    };
 
     // 读取数据库配置（可选，用于 EXPLAIN）
     let db_config: Option<diag_core::config::DatabaseConfig> = {
@@ -1478,69 +1891,154 @@ pub async fn start_quick_diagnosis(
         );
     }
 
-    // 覆盖字段映射
-    let field_tid = field_trace_id.unwrap_or_else(|| "x0".to_string());
-    let field_msg = field_message.unwrap_or_else(|| "msg".to_string());
+    let source = log_source.unwrap_or_else(|| "elk".to_string());
 
-    let idx_pattern = index_pattern.unwrap_or_else(|| elk_deployment.index_pattern.clone());
+    // 快速诊断按 traceId 检索，仅支持 ELK / ES；SSH 等其它源给出明确提示。
+    if !source_supports_mode(&source, "quick") {
+        return Err(format!(
+            "快速诊断模式暂不支持「{}」日志源，请切换为 ELK 或 ES",
+            source
+        ));
+    }
 
-    let elk_config = ElkConfig {
-        address: elk_deployment.address.clone(),
-        index_pattern: idx_pattern.clone(),
-        username: elk_deployment.username.clone(),
-        password: elk_deployment.password.clone(),
-        timeout_secs: elk_deployment.timeout_secs.unwrap_or(30),
-        max_hits_per_trace: elk_deployment.max_hits_per_trace.unwrap_or(2000),
-        field_mapping: FieldMapping {
-            timestamp: elk_deployment
-                .field_timestamp
-                .clone()
-                .unwrap_or_else(|| "@timestamp".into()),
-            level: elk_deployment
-                .field_level
-                .clone()
-                .unwrap_or_else(|| "level".into()),
-            service: elk_deployment
-                .field_service
-                .clone()
-                .unwrap_or_else(|| "serviceName".into()),
-            trace_id: field_tid.clone(),
-            message: field_msg.clone(),
-            exception: "exception".into(),
-            stack_trace: "stackTrace".into(),
-            thread: "thread".into(),
-        },
-    };
+    let log_collector: Box<dyn diag_core::collector_trait::LogCollector> = match source.as_str() {
+        "es" => {
+            let es_deployment = {
+                let manifest = state.manifest.lock().unwrap();
+                let manifest = manifest.as_ref().ok_or("请先配置 ES 直接模式配置信息")?;
+                manifest
+                    .es
+                    .as_ref()
+                    .ok_or("快速诊断需要 ES 配置")?
+                    .clone()
+            };
+            let idx_pattern = index_pattern.unwrap_or_else(|| es_deployment.index_pattern.clone());
+            let field_tid = field_trace_id
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| es_deployment.field_trace_id.clone())
+                .unwrap_or_else(|| "traceId".to_string());
+            let field_msg = field_message
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| es_deployment.field_message.clone())
+                .unwrap_or_else(|| "message".to_string());
 
-    emit_step(
-        &app,
-        "elk-connect",
-        &format!(
-            "连接 ELK：{}，索引={}，traceId 字段={}, msg 字段={}",
-            elk_config.address, idx_pattern, field_tid, field_msg
-        ),
-        "running",
-    );
+            let es_config = diag_core::config::EsConfig {
+                address: es_deployment.address.clone(),
+                index_pattern: idx_pattern.clone(),
+                username: es_deployment.username.clone(),
+                password: es_deployment.password.clone(),
+                timeout_secs: es_deployment.timeout_secs.unwrap_or(30),
+                max_hits_per_trace: es_deployment.max_hits_per_trace.unwrap_or(2000),
+                field_mapping: FieldMapping {
+                    timestamp: es_deployment.field_timestamp.clone().unwrap_or_else(|| "@timestamp".into()),
+                    level: es_deployment.field_level.clone().unwrap_or_else(|| "level".into()),
+                    trace_id: field_tid.clone(),
+                    service: es_deployment.field_service.clone().unwrap_or_else(|| "serviceName".into()),
+                    message: field_msg.clone(),
+                    exception: "exception".into(),
+                    stack_trace: "stackTrace".into(),
+                    thread: "thread".into(),
+                },
+            };
 
-    // 创建 ELK collector
-    let elk_collector = crate::elk_collector::ElkCollector::new(elk_config)
-        .await
-        .map_err(|e| {
             emit_step(
                 &app,
                 "elk-connect",
-                &format!("ELK 连接失败：{}", e),
-                "error",
+                &format!(
+                    "连接 ES：{}，索引={}，traceId 字段={}, msg 字段={}",
+                    es_config.address, idx_pattern, field_tid, field_msg
+                ),
+                "running",
             );
-            format!("ELK 连接失败: {}", e)
-        })?;
 
-    emit_step(
-        &app,
-        "elk-connect",
-        &format!("ELK 连接成功（ES {}）", elk_collector.es_major_version()),
-        "done",
-    );
+            let es_collector = crate::es_collector::EsCollector::new(es_config).await
+                .map_err(|e| {
+                    emit_step(
+                        &app,
+                        "elk-connect",
+                        &format!("ES 连接失败：{}", e),
+                        "error",
+                    );
+                    format!("ES 连接失败: {}", e)
+                })?;
+
+            emit_step(
+                &app,
+                "elk-connect",
+                "ES 连接成功",
+                "done",
+            );
+            Box::new(es_collector)
+        }
+        _ => {
+            let elk_deployment = {
+                let manifest = state.manifest.lock().unwrap();
+                let manifest = manifest.as_ref().ok_or("请先配置 ELK 信息")?;
+                manifest
+                    .elk
+                    .as_ref()
+                    .ok_or("快速诊断需要 ELK 配置")?
+                    .clone()
+            };
+            let idx_pattern = index_pattern.unwrap_or_else(|| elk_deployment.index_pattern.clone());
+            let field_tid = field_trace_id
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| elk_deployment.field_trace_id.clone())
+                .unwrap_or_else(|| "traceId".to_string());
+            let field_msg = field_message
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| elk_deployment.field_message.clone())
+                .unwrap_or_else(|| "message".to_string());
+
+            let elk_config = diag_core::config::ElkConfig {
+                address: elk_deployment.address.clone(),
+                index_pattern: idx_pattern.clone(),
+                username: elk_deployment.username.clone(),
+                password: elk_deployment.password.clone(),
+                timeout_secs: elk_deployment.timeout_secs.unwrap_or(30),
+                max_hits_per_trace: elk_deployment.max_hits_per_trace.unwrap_or(2000),
+                field_mapping: FieldMapping {
+                    timestamp: elk_deployment.field_timestamp.clone().unwrap_or_else(|| "@timestamp".into()),
+                    level: elk_deployment.field_level.clone().unwrap_or_else(|| "level".into()),
+                    trace_id: field_tid.clone(),
+                    service: elk_deployment.field_service.clone().unwrap_or_else(|| "serviceName".into()),
+                    message: field_msg.clone(),
+                    exception: "exception".into(),
+                    stack_trace: "stackTrace".into(),
+                    thread: "thread".into(),
+                },
+            };
+
+            emit_step(
+                &app,
+                "elk-connect",
+                &format!(
+                    "连接 ELK：{}，索引={}，traceId 字段={}, msg 字段={}",
+                    elk_config.address, idx_pattern, field_tid, field_msg
+                ),
+                "running",
+            );
+
+            let elk_collector = crate::elk_collector::ElkCollector::new(elk_config).await
+                .map_err(|e| {
+                    emit_step(
+                        &app,
+                        "elk-connect",
+                        &format!("ELK 连接失败：{}", e),
+                        "error",
+                    );
+                    format!("ELK 连接失败: {}", e)
+                })?;
+
+            emit_step(
+                &app,
+                "elk-connect",
+                &format!("ELK 连接成功（ES {}）", elk_collector.es_major_version()),
+                "done",
+            );
+            Box::new(elk_collector)
+        }
+    };
 
     // 查询日志
     emit_step(
@@ -1555,12 +2053,12 @@ pub async fn start_quick_diagnosis(
         end: String::new(),
     };
 
-    let logs = elk_collector
-        .query_by_exact_trace_ids(&[trace_id.clone()], &empty_window)
+    let logs = log_collector
+        .query_by_trace_ids(&[trace_id.clone()], None, &empty_window)
         .await
         .map_err(|e| {
             emit_step(&app, "elk-query", &format!("查询失败：{}", e), "error");
-            format!("ELK 查询失败: {}", e)
+            format!("查询失败: {}", e)
         })?;
 
     if logs.is_empty() {
@@ -1915,4 +2413,45 @@ pub fn open_output_dir(path: String) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_supports_mode;
+
+    #[test]
+    fn realtime_supports_all_three_sources() {
+        for src in ["elk", "es", "ssh"] {
+            assert!(
+                source_supports_mode(src, "realtime"),
+                "realtime 应支持 {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn history_and_quick_support_only_elk_and_es() {
+        for mode in ["history", "quick"] {
+            assert!(source_supports_mode("elk", mode));
+            assert!(source_supports_mode("es", mode));
+            assert!(
+                !source_supports_mode("ssh", mode),
+                "{mode} 不应支持 ssh（会落到 elk.unwrap 崩溃）"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_supports_only_elk() {
+        assert!(source_supports_mode("elk", "scheduler"));
+        assert!(!source_supports_mode("es", "scheduler"));
+        assert!(!source_supports_mode("ssh", "scheduler"));
+    }
+
+    #[test]
+    fn unknown_source_or_mode_is_unsupported() {
+        assert!(!source_supports_mode("kafka", "realtime"));
+        assert!(!source_supports_mode("elk", "teleport"));
+        assert!(!source_supports_mode("", ""));
+    }
 }

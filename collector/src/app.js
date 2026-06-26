@@ -16,11 +16,16 @@ const state = {
   scheduleEnabled: false,
 
   // Phase 2: 日志配置
-  logSource: 'elk',        // 'elk' | 'ssh'
+  logSource: 'elk',        // 当前「选中查看」的配置面板：'elk' | 'es' | 'ssh'
+  activeSource: null,      // 「测试通过并激活」的日志源，诊断实际使用的就是它（null=尚未激活）
   svcImported: false,
   elkAddressFilled: false,
   elkValidated: false,
+  esAddressFilled: false,
+  esValidated: false,
   sshValidated: false,
+  discoveredEsConfig: null,
+  discoveredEsConfigDirect: null,
 
   // Phase 3: 数据库与模式
   dbType: 'mysql',         // 'mysql' | 'postgresql'
@@ -97,15 +102,19 @@ async function canNavigateTo(targetStep) {
     }
   }
 
-  // 校验第二步：必须填写 ELK 地址（ELK 模式）或导入服务配置（SSH 模式）
+  // 校验第二步：按当前激活的日志源分别校验（ELK 地址 / ES 地址 / SSH 服务导入）
   if (targetStep > 2) {
     if (state.logSource === 'elk') {
-      const elkAddr = document.getElementById('elk-address').value.trim();
-      if (!elkAddr) {
+      if (!document.getElementById('elk-address').value.trim()) {
         showToast('请输入 ELK 地址', 'error');
         return false;
       }
-    } else {
+    } else if (state.logSource === 'es') {
+      if (!document.getElementById('es-address').value.trim()) {
+        showToast('请输入 ES 地址', 'error');
+        return false;
+      }
+    } else { // ssh
       if (!state.svcImported) {
         showToast('请先导入服务部署 CSV 配置', 'error');
         return false;
@@ -176,11 +185,19 @@ async function saveStepConfig(step) {
       } catch (e) { console.warn('保存第一步配置失败:', e); }
     }
   } else if (step === 2) {
+    // 无论当前激活哪种日志源，只要地址非空就两个都保存，
+    // 防止切换模式时另一种配置丢失
     const elkAddr = document.getElementById('elk-address')?.value.trim() || '';
-    if (state.logSource === 'elk' && elkAddr) {
+    if (elkAddr) {
       try {
         await invoke('set_elk_config', { elk: buildElkConfig() });
       } catch (e) { console.warn('保存 ELK 配置失败:', e); }
+    }
+    const esAddr = document.getElementById('es-address')?.value.trim() || '';
+    if (esAddr) {
+      try {
+        await invoke('set_es_config', { es: buildEsConfig() });
+      } catch (e) { console.warn('保存 ES 配置失败:', e); }
     }
   } else if (step === 3) {
     const dbHost = document.getElementById('db-host')?.value.trim() || '';
@@ -221,17 +238,31 @@ function checkPhase1Ready() {
 function initPhase2() {
   document.getElementById('source-elk').addEventListener('click', () => setLogSource('elk'));
   document.getElementById('source-elk').addEventListener('keydown', e => e.key === 'Enter' && setLogSource('elk'));
+  document.getElementById('source-es').addEventListener('click', () => setLogSource('es'));
+  document.getElementById('source-es').addEventListener('keydown', e => e.key === 'Enter' && setLogSource('es'));
   document.getElementById('source-ssh').addEventListener('click', () => setLogSource('ssh'));
   document.getElementById('source-ssh').addEventListener('keydown', e => e.key === 'Enter' && setLogSource('ssh'));
 
   document.getElementById('elk-address').addEventListener('input', () => {
     state.elkAddressFilled = document.getElementById('elk-address').value.trim().length > 0;
+    populateVerifyAddresses();
+    checkPhase2Ready();
+  });
+
+  document.getElementById('es-address').addEventListener('input', () => {
+    state.esAddressFilled = document.getElementById('es-address').value.trim().length > 0;
+    populateVerifyAddresses();
     checkPhase2Ready();
   });
 
   setupPasswordEye('elk-password', 'btn-elk-eye', 'elk-eye-icon');
+  setupPasswordEye('es-password', 'btn-es-eye', 'es-eye-icon');
+
   document.getElementById('elk-adv-toggle').addEventListener('click', () => {
     toggleAdvanced('elk-adv-toggle', 'elk-adv-content');
+  });
+  document.getElementById('es-adv-toggle').addEventListener('click', () => {
+    toggleAdvanced('es-adv-toggle', 'es-adv-content');
   });
 
   // SSH CSV file drop
@@ -255,6 +286,11 @@ function initPhase2() {
 
   // Validation buttons
   document.getElementById('btn-test-elk').addEventListener('click', testElk);
+  document.getElementById('btn-discover-es').addEventListener('click', discoverEsConfig);
+  document.getElementById('btn-apply-es-config').addEventListener('click', applyEsConfig);
+  document.getElementById('btn-test-es').addEventListener('click', testEs);
+  document.getElementById('btn-discover-es-direct').addEventListener('click', discoverEsConfigDirect);
+  document.getElementById('btn-apply-es-config-direct').addEventListener('click', applyEsConfigDirect);
   document.getElementById('btn-validate-svc').addEventListener('click', validateSvc);
 
   document.getElementById('btn-backto-phase1').addEventListener('click', () => jumpToStep(1));
@@ -264,17 +300,58 @@ function initPhase2() {
 function setLogSource(src) {
   state.logSource = src;
   document.getElementById('source-elk').classList.toggle('selected', src === 'elk');
+  document.getElementById('source-es').classList.toggle('selected', src === 'es');
   document.getElementById('source-ssh').classList.toggle('selected', src === 'ssh');
   document.getElementById('elk-config-area').style.display = src === 'elk' ? 'block' : 'none';
   document.getElementById('elk-verify-card').style.display = src === 'elk' ? 'block' : 'none';
+  document.getElementById('es-config-area').style.display = src === 'es' ? 'block' : 'none';
+  document.getElementById('es-verify-card').style.display = src === 'es' ? 'block' : 'none';
   document.getElementById('ssh-config-area').style.display = src === 'ssh' ? 'block' : 'none';
   document.getElementById('ssh-verify-card').style.display = src === 'ssh' ? 'block' : 'none';
+  
+  // 快速诊断的字段配置均已移至全局配置页，诊断界面不再包含配置信息
+
+  populateVerifyAddresses();
   checkPhase2Ready();
+  // 注意：仅「选中」不代表「激活」。激活由 setActiveSource 在连接测试通过后触发。
+}
+
+/**
+ * 标记某个日志源为「已激活」（测试通过后调用）。
+ * 全局只允许一个激活源；激活后才会显示「✓ 已激活」徽标，并作为诊断实际使用的日志源持久化。
+ */
+function setActiveSource(src) {
+  state.activeSource = src;
+  ['elk', 'es', 'ssh'].forEach(s => {
+    document.getElementById('source-' + s).classList.toggle('activated', s === src);
+  });
+  // 持久化激活的日志来源——诊断、定时巡检、重启恢复都以它为准
+  invoke('set_log_source', { logSource: src }).catch(e => {
+    console.debug('日志来源暂时不能持久化:', e);
+  });
+}
+
+/** 撤销激活状态。仅当被撤销的正是当前激活源时才清除（测试失败/配置变更时调用）。 */
+function clearActiveSource(src) {
+  if (src && state.activeSource !== src) return;
+  state.activeSource = null;
+  ['elk', 'es', 'ssh'].forEach(s => {
+    document.getElementById('source-' + s).classList.remove('activated');
+  });
+}
+
+/** 诊断入口的统一校验：必须先有一个「测试通过并激活」的日志源。返回激活源或 null。 */
+function requireActiveSource() {
+  if (!state.activeSource) {
+    showToast('请先在「日志配置」中测试并激活一个日志源（测试通过后才会标记为已激活）', 'error', 5000);
+    return null;
+  }
+  return state.activeSource;
 }
 
 function checkPhase2Ready() {
-  // 必须填了 ELK 或导入了 SSH
   const logOk = (state.logSource === 'elk' && state.elkAddressFilled)
+             || (state.logSource === 'es' && state.esAddressFilled)
              || (state.logSource === 'ssh' && state.svcImported);
   document.getElementById('btn-goto-phase3').disabled = !logOk;
 }
@@ -282,6 +359,8 @@ function checkPhase2Ready() {
 function populateVerifyAddresses() {
   const elkAddr = document.getElementById('elk-address').value.trim();
   document.getElementById('elk-verify-addr').textContent = elkAddr || '未配置';
+  const esAddr = document.getElementById('es-address').value.trim();
+  document.getElementById('es-verify-addr').textContent = esAddr || '未配置';
 }
 
 async function testElk() {
@@ -299,11 +378,221 @@ async function testElk() {
     });
     setVerifyStatus('elk', 'ok', '连接成功', `ES ${result.esVersion || '未知版本'} — 连接成功`, 'ok');
     state.elkValidated = true;
-    showToast('ELK 连接测试成功', 'success');
+    setActiveSource('elk');
+    showToast('ELK 连接测试成功，已激活为当前日志源', 'success');
   } catch (err) {
     setVerifyStatus('elk', 'fail', '连接失败', String(err), 'fail');
     state.elkValidated = false;
+    clearActiveSource('elk');
     showToast('ELK 连接失败: ' + err, 'error');
+  }
+
+  btn.disabled = false;
+}
+
+async function testEs() {
+  const btn = document.getElementById('btn-test-es');
+  btn.disabled = true;
+  setVerifyStatus('es', 'testing', '测试中...');
+
+  try {
+    const es = buildEsConfig();
+    const result = await invoke('test_es_connection', {
+      address:      es.address,
+      indexPattern: es.indexPattern,
+      username:     es.username,
+      password:     es.password,
+    });
+    setVerifyStatus('es', 'ok', '连接成功', `ES ${result.esVersion || '未知版本'} — 连接成功`, 'ok');
+    state.esValidated = true;
+    setActiveSource('es');
+    showToast('ES 连接测试成功，已激活为当前日志源', 'success');
+  } catch (err) {
+    setVerifyStatus('es', 'fail', '连接失败', String(err), 'fail');
+    state.esValidated = false;
+    clearActiveSource('es');
+    showToast('ES 连接失败: ' + err, 'error');
+  }
+
+  btn.disabled = false;
+}
+
+async function discoverEsConfigDirect() {
+  const btn = document.getElementById('btn-discover-es-direct');
+  const panel = document.getElementById('es-discover-panel-direct');
+  const fieldsDiv = document.getElementById('es-discover-fields-direct');
+  const servicesListDiv = document.getElementById('es-discover-services-list-direct');
+
+  btn.disabled = true;
+  panel.style.display = 'none';
+  setVerifyStatus('es', 'testing', '正在自动探测...');
+
+  try {
+    const es = buildEsConfig();
+    const result = await invoke('discover_log_config_from_es', {
+      address:      es.address,
+      indexPattern: es.indexPattern,
+      username:     es.username,
+      password:     es.password,
+    });
+
+    state.discoveredEsConfigDirect = result;
+    setVerifyStatus('es', 'ok', '探测成功', `探测成功，共发现 ${result.services.length} 个活跃微服务。`, 'ok');
+    showToast('ES 智能探查成功', 'success');
+
+    const mapping = result.fieldMapping;
+    fieldsDiv.innerHTML = `
+      <div style="margin-bottom: 4px;"><strong>时间戳字段</strong>: <code>${mapping.timestamp}</code></div>
+      <div style="margin-bottom: 4px;"><strong>日志级别字段</strong>: <code>${mapping.level}</code></div>
+      <div style="margin-bottom: 4px;"><strong>TraceId 字段</strong>: <code>${mapping.traceId}</code></div>
+      <div style="margin-bottom: 4px;"><strong>服务名字段</strong>: <code>${mapping.service}</code></div>
+      <div style="margin-bottom: 0px;"><strong>消息字段</strong>: <code>${mapping.message}</code></div>
+    `;
+
+    if (result.services.length === 0) {
+      servicesListDiv.innerHTML = '<div style="color:var(--text-3); font-size:12px; grid-column: 1 / -1;">未探测到任何活跃微服务日志。</div>';
+    } else {
+      servicesListDiv.innerHTML = result.services.map(name => `
+        <label style="display:flex; align-items:center; gap:6px; color:var(--text-2); cursor:pointer;">
+          <input type="checkbox" name="es-discover-svc-direct" value="${name}" checked />
+          <span>${name}</span>
+        </label>
+      `).join('');
+    }
+
+    panel.style.display = 'block';
+  } catch (err) {
+    setVerifyStatus('es', 'fail', '探测失败', String(err), 'fail');
+    showToast('ES 探测失败: ' + err, 'error');
+  }
+
+  btn.disabled = false;
+}
+
+async function applyEsConfigDirect() {
+  if (!state.discoveredEsConfigDirect) return;
+
+  const btn = document.getElementById('btn-apply-es-config-direct');
+  btn.disabled = true;
+
+  try {
+    const checkedBoxes = document.querySelectorAll('input[name="es-discover-svc-direct"]:checked');
+    const selectedServices = Array.from(checkedBoxes).map(cb => cb.value);
+
+    const mapping = state.discoveredEsConfigDirect.fieldMapping;
+    document.getElementById('es-field-timestamp').value = mapping.timestamp;
+    document.getElementById('es-field-level').value = mapping.level;
+    document.getElementById('es-field-traceid').value = mapping.traceId;
+    document.getElementById('es-field-service').value = mapping.service;
+    document.getElementById('es-field-message').value = mapping.message;
+
+    const es = buildEsConfig();
+    await invoke('set_es_config', { es });
+
+    state.esAddressFilled = true;
+
+    showToast(`配置应用成功！已激活 ${selectedServices.length} 个服务日志字段映射。`, 'success');
+    checkPhase2Ready();
+
+    await invoke('save_config_to_disk', {});
+  } catch (err) {
+    showToast('保存 ES 配置失败: ' + err, 'error');
+  }
+
+  btn.disabled = false;
+}
+
+async function discoverEsConfig() {
+  const btn = document.getElementById('btn-discover-es');
+  const panel = document.getElementById('es-discover-panel');
+  const fieldsDiv = document.getElementById('es-discover-fields');
+  const servicesListDiv = document.getElementById('es-discover-services-list');
+
+  btn.disabled = true;
+  panel.style.display = 'none';
+  setVerifyStatus('elk', 'testing', '正在自动探测...');
+
+  try {
+    const elk = buildElkConfig();
+    const result = await invoke('discover_log_config_from_es', {
+      address:      elk.address,
+      indexPattern: elk.indexPattern,
+      username:     elk.username,
+      password:     elk.password,
+    });
+
+    state.discoveredEsConfig = result;
+    setVerifyStatus('elk', 'ok', '探测成功', `探测成功，共发现 ${result.services.length} 个活跃微服务。`, 'ok');
+    showToast('ES 智能探查成功', 'success');
+
+    // 展示字段探测报告
+    const mapping = result.fieldMapping;
+    fieldsDiv.innerHTML = `
+      <div style="margin-bottom: 4px;"><strong>时间戳字段</strong>: <code>${mapping.timestamp}</code></div>
+      <div style="margin-bottom: 4px;"><strong>日志级别字段</strong>: <code>${mapping.level}</code></div>
+      <div style="margin-bottom: 4px;"><strong>TraceId 字段</strong>: <code>${mapping.traceId}</code></div>
+      <div style="margin-bottom: 4px;"><strong>服务名字段</strong>: <code>${mapping.service}</code></div>
+      <div style="margin-bottom: 0px;"><strong>消息字段</strong>: <code>${mapping.message}</code></div>
+    `;
+
+    // 展示服务复选框
+    if (result.services.length === 0) {
+      servicesListDiv.innerHTML = '<div style="color:var(--text-3); font-size:12px; grid-column: 1 / -1;">未探测到任何活跃微服务日志。</div>';
+    } else {
+      servicesListDiv.innerHTML = result.services.map(name => `
+        <label style="display:flex; align-items:center; gap:6px; color:var(--text-2); cursor:pointer;">
+          <input type="checkbox" name="es-discover-svc" value="${name}" checked />
+          <span>${name}</span>
+        </label>
+      `).join('');
+    }
+
+    panel.style.display = 'block';
+  } catch (err) {
+    setVerifyStatus('elk', 'fail', '探测失败', String(err), 'fail');
+    showToast('ES 探测失败: ' + err, 'error');
+  }
+
+  btn.disabled = false;
+}
+
+async function applyEsConfig() {
+  if (!state.discoveredEsConfig) return;
+
+  const btn = document.getElementById('btn-apply-es-config');
+  btn.disabled = true;
+
+  try {
+    // 1. 获取选中的服务
+    const checkedBoxes = document.querySelectorAll('input[name="es-discover-svc"]:checked');
+    const selectedServices = Array.from(checkedBoxes).map(cb => cb.value);
+
+    // 2. 回填字段映射到 UI 高级字段输入框中
+    const mapping = state.discoveredEsConfig.fieldMapping;
+    document.getElementById('elk-field-timestamp').value = mapping.timestamp;
+    document.getElementById('elk-field-level').value = mapping.level;
+    document.getElementById('elk-field-traceid').value = mapping.traceId;
+    document.getElementById('elk-field-service').value = mapping.service;
+    document.getElementById('elk-field-message').value = mapping.message;
+
+    // 3. 将配置保存回后端 manifest 中
+    const elk = buildElkConfig();
+    await invoke('set_elk_config', { elk });
+
+    // 4. 更新前端状态
+    state.svcImported = true;
+    state.elkAddressFilled = true;
+
+    showToast(`配置应用成功！已激活 ${selectedServices.length} 个服务日志字段映射。`, 'success');
+    checkPhase2Ready();
+
+    // 自动保存至磁盘
+    await invoke('save_config_to_disk', {});
+
+    // 隐藏探测结果卡片
+    document.getElementById('es-discover-panel').style.display = 'none';
+  } catch (err) {
+    showToast('应用配置失败: ' + err, 'error');
   }
 
   btn.disabled = false;
@@ -332,12 +621,18 @@ async function validateSvc() {
       : '';
     setVerifyStatus('ssh', allOk ? 'ok' : 'fail', allOk ? '全部通过' : '部分失败');
     state.sshValidated = allOk;
-    if (allOk) showToast('所有服务 SSH 校验通过', 'success');
-    else showToast('部分服务 SSH 校验失败，请检查', 'error');
+    if (allOk) {
+      setActiveSource('ssh');
+      showToast('所有服务 SSH 校验通过，已激活为当前日志源', 'success');
+    } else {
+      clearActiveSource('ssh');
+      showToast('部分服务 SSH 校验失败，请检查', 'error');
+    }
   } catch (err) {
     listEl.innerHTML = `<span style="font-size:12px;color:var(--error)">${err}</span>`;
     setVerifyStatus('ssh', 'fail', '服务校验失败');
     state.sshValidated = false;
+    clearActiveSource('ssh');
     showToast('服务校验失败: ' + err, 'error');
   }
 
@@ -664,6 +959,11 @@ async function preparePhase4() {
 }
 
 function switchMode(mode) {
+  // SSH 日志源仅支持实时模式（历史/快速/定时巡检依赖 ELK/ES 的关键词与 traceId 检索）
+  if (state.activeSource === 'ssh' && mode !== 'realtime') {
+    showToast('SSH 日志源仅支持实时诊断，历史/快速/定时巡检请切换为 ELK 或 ES', 'info', 5000);
+    mode = 'realtime';
+  }
   state.diagMode = mode;
   ['realtime', 'history', 'scheduler', 'quick'].forEach(m => {
     const card = document.getElementById('mode-' + m);
@@ -845,6 +1145,9 @@ function appendRequestRow(tbody, req, path) {
 }
 
 async function runDiagnosis(capturedJson) {
+  const activeSource = requireActiveSource();
+  if (!activeSource) return;
+
   const stepDefs = [
     '解析请求 URL，匹配后端服务',
     'SSH/ELK 采集链路关联日志',
@@ -873,7 +1176,7 @@ async function runDiagnosis(capturedJson) {
 
     if (i === stepDefs.length - 1) {
       try {
-        result = await invoke('start_diagnosis', { capturedJson });
+        result = await invoke('start_diagnosis', { capturedJson, logSource: activeSource });
       } catch (err) {
         diagErr = err;
       }
@@ -990,6 +1293,9 @@ const HIST_STEPS = [
 const HIST_TOTAL_WEIGHT = HIST_STEPS.reduce((s, x) => s + x.weight, 0);
 
 async function runHistoricalDiagnosis() {
+  const activeSource = requireActiveSource();
+  if (!activeSource) return;
+
   const keywordsRaw = document.getElementById('history-keywords').value.trim();
   if (!keywordsRaw) { showToast('请输入查询关键词/traceId', 'error'); return; }
 
@@ -1063,7 +1369,7 @@ async function runHistoricalDiagnosis() {
   }
 
   try {
-    const result = await invoke('start_historical_diagnosis', { keywords, timeStart, timeEnd });
+    const result = await invoke('start_historical_diagnosis', { keywords, timeStart, timeEnd, logSource: activeSource });
     setProgressBar('history-progress-bar', 1);
     showHistoryResult(result);
   } catch (err) {
@@ -1228,12 +1534,11 @@ function refreshSchedulerPackageList(payload) {
 // ─── Quick Mode ───
 
 async function runQuickDiagnosis() {
+  const activeSource = requireActiveSource();
+  if (!activeSource) return;
+
   const traceId = document.getElementById('quick-trace-id').value.trim();
   if (!traceId) { showToast('请输入 traceId', 'error'); return; }
-
-  const fieldTraceId = document.getElementById('quick-field-traceid').value.trim() || 'x0';
-  const fieldMessage = document.getElementById('quick-field-message').value.trim() || 'msg';
-  const indexPattern = document.getElementById('quick-index-pattern').value.trim() || null;
 
   const btn = document.getElementById('btn-quick-run');
   btn.disabled = true;
@@ -1253,9 +1558,10 @@ async function runQuickDiagnosis() {
   try {
     const result = await invoke('start_quick_diagnosis', {
       traceId,
-      fieldTraceId,
-      fieldMessage,
-      indexPattern: indexPattern || null,
+      fieldTraceId: null,
+      fieldMessage: null,
+      indexPattern: null,
+      logSource: activeSource,
     });
 
     document.getElementById('quick-result-card').style.display = 'block';
@@ -1333,7 +1639,45 @@ function fillFormFromManifest(m) {
     if (e.fieldService)   setVal('elk-field-service',   e.fieldService);
     if (e.fieldMessage)   setVal('elk-field-message',   e.fieldMessage);
     state.elkAddressFilled = !!(e.address);
+  }
+
+  if (m.es) {
+    const e = m.es;
+    setVal('es-address',   e.address || '');
+    setVal('es-index-pattern', e.indexPattern || 'logstash-*');
+    setVal('es-username',  e.username || '');
+    setVal('es-password',  e.password || '');
+    if (e.fieldTimestamp) setVal('es-field-timestamp', e.fieldTimestamp);
+    if (e.fieldLevel)     setVal('es-field-level',     e.fieldLevel);
+    if (e.fieldTraceId)   setVal('es-field-traceid',   e.fieldTraceId);
+    if (e.fieldService)   setVal('es-field-service',   e.fieldService);
+    if (e.fieldMessage)   setVal('es-field-message',   e.fieldMessage);
+    state.esAddressFilled = !!(e.address);
+  }
+
+  // 先恢复 SSH 服务列表 UI——无论当前激活哪种日志源，只要存在服务配置就回填预览，
+  // 否则切到 SSH 源后 svcImported 仍为 false 会卡在第二步无法继续。
+  if (m.services && m.services.length > 0) {
+    const firstIp = m.services[0].serverIp;
+    if (firstIp && firstIp !== 'elk' && firstIp !== 'es') {
+      state.svcImported = true;
+      const drop = document.getElementById('svc-drop');
+      drop.classList.add('loaded');
+      drop.querySelector('.file-drop-text').textContent = `已成功从磁盘加载 ${m.services.length} 个服务配置`;
+      renderSvcPreview(m.services);
+    }
+  }
+
+  // 恢复活跃的 logSource——优先从 manifest.logSource 读取，其次按配置内容推断（兼容旧数据）
+  const savedSource = m.logSource;
+  if (savedSource === 'es' || savedSource === 'elk' || savedSource === 'ssh') {
+    setLogSource(savedSource);
+  } else if (m.es && (!m.elk || !m.elk.address)) {
+    setLogSource('es');
+  } else if (m.elk) {
     setLogSource('elk');
+  } else if (state.svcImported) {
+    setLogSource('ssh');
   }
 
   if (m.databases && m.databases.length > 0) {
@@ -1601,9 +1945,23 @@ function buildElkConfig() {
     password:      document.getElementById('elk-password').value || null,
     fieldTimestamp:document.getElementById('elk-field-timestamp').value.trim() || '@timestamp',
     fieldLevel:    document.getElementById('elk-field-level').value.trim() || 'level',
-    fieldTraceId:  document.getElementById('elk-field-traceid').value.trim() || 'x0',
+    fieldTraceId:  document.getElementById('elk-field-traceid').value.trim() || 'traceId',
     fieldService:  document.getElementById('elk-field-service').value.trim() || 'serviceName',
-    fieldMessage:  document.getElementById('elk-field-message').value.trim() || 'msg',
+    fieldMessage:  document.getElementById('elk-field-message').value.trim() || 'message',
+  };
+}
+
+function buildEsConfig() {
+  return {
+    address:       document.getElementById('es-address').value.trim(),
+    indexPattern:  document.getElementById('es-index-pattern').value.trim() || 'logstash-*',
+    username:      document.getElementById('es-username').value.trim() || null,
+    password:      document.getElementById('es-password').value || null,
+    fieldTimestamp:document.getElementById('es-field-timestamp').value.trim() || '@timestamp',
+    fieldLevel:    document.getElementById('es-field-level').value.trim() || 'level',
+    fieldTraceId:  document.getElementById('es-field-traceid').value.trim() || 'traceId',
+    fieldService:  document.getElementById('es-field-service').value.trim() || 'serviceName',
+    fieldMessage:  document.getElementById('es-field-message').value.trim() || 'message',
   };
 }
 

@@ -395,12 +395,13 @@ body {
 /* ─── Source Cards (log source toggle) ─── */
 .source-cards {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 8px;
   margin-bottom: 14px;
 }
 
 .source-card {
+  position: relative;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 12px;
@@ -415,6 +416,27 @@ body {
   border-color: var(--accent);
   background: var(--accent-dim);
 }
+
+/* 激活徽标：仅在「测试通过并激活」的日志源卡片上显示 */
+.source-badge {
+  display: none;
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--success, var(--accent));
+  border-radius: 999px;
+  padding: 2px 8px;
+  line-height: 1.4;
+  letter-spacing: .3px;
+}
+
+.source-card.activated .source-badge { display: inline-block; }
+
+/* 已激活卡片用成功色描边，与「仅选中未测试」区分开 */
+.source-card.activated { border-color: var(--success, var(--accent)); }
 
 .source-card-title {
   font-size: 13px;

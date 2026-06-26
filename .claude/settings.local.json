@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(npx tauri *)",
+      "Bash(cargo tauri *)",
+      "Bash(head -62 /Users/sakya-mac/eclipse-workspace/iflytek-project/Smart-Diagnostic-System/collector/src/app.js)",
+      "Bash(tail -n +83 /Users/sakya-mac/eclipse-workspace/iflytek-project/Smart-Diagnostic-System/collector/src/app.js)",
+      "Bash(python3 *)",
+      "Bash(brew services *)",
+      "Bash(mysql -u root -e \"SELECT 1\")",
+      "Bash(mysql -u sakya-mac -e \"SELECT 1\")",
+      "Bash(mysql -u root -p'' -e \"SELECT 1\")",
+      "Bash(mysql *)",
+      "Bash(docker exec health-edu-mysql *)",
+      "Bash(mkdir -p /tmp/diag-test/pcm-server/logs /tmp/diag-test/pcm-user/logs /tmp/diag-test/pcm-management/logs)",
+      "Bash(echo \"2026-05-11 10:00:00 INFO [main] Application started\")",
+      "Bash(echo \"2026-05-11 10:01:00 ERROR [http-nio] NullPointerException at UserService.java:42\")",
+      "Bash(echo \"2026-05-11 10:02:00 INFO [scheduler] Task completed\")",
+      "Bash(pkill -f \"cargo-tauri\")",
+      "Bash(pkill -f \"smart-diag-collector\")",
+      "Skill(agent-browser)",
+      "Bash(open *)",
+      "Bash(git -C /Users/sakya-mac/eclipse-workspace/iflytek-project/Smart-Diagnostic-System add docs/superpowers/specs/2026-05-26-collector-v2-design.md)",
+      "Bash(git -C /Users/sakya-mac/eclipse-workspace/iflytek-project/Smart-Diagnostic-System commit -m ' *)",
+      "Bash(git -C /Users/sakya-mac/eclipse-workspace/iflytek-project/Smart-Diagnostic-System add docs/superpowers/plans/2026-05-26-collector-v2.md)",
+      "Bash(git *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(cargo test *)",
+      "Bash(node -e ' *)",
+      "Bash(echo \"PID: $!\")",
+      "Bash(cargo check *)",
+      "Bash(node --check collector/src/app.js)",
+      "Bash(kill %1)",
+      "Bash(pkill -f \"cargo tauri dev\")"
+    ]
+  }
+}

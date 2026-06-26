@@ -759,9 +759,12 @@ fn request_priority(
 
 fn logs_for_trace<'a>(logs: &'a [LogEntry], trace_id: Option<&str>) -> Vec<&'a LogEntry> {
     match trace_id {
+        // 直接按 trace_id 字段匹配；再以 raw（完整 _source）兜底：
+        // ES 返回该文档正是因为命中了此 traceId（存于 x0 或 msg），即便字段映射取偏，
+        // raw 里也一定包含该 id——traceId 为 32 位十六进制，几乎不可能误撞，匹配安全。
         Some(id) => logs
             .iter()
-            .filter(|entry| entry.trace_id.as_deref() == Some(id))
+            .filter(|entry| entry.trace_id.as_deref() == Some(id) || entry.raw.contains(id))
             .collect(),
         None => Vec::new(),
     }

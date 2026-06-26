@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo tauri *)",
+      "Bash(cargo test *)",
+      "Read(//Users/sakya-mac/eclipse-workspace/iflytek-project/Smart-Diagnostic-System/**)",
+      "Bash(cargo build *)",
+      "Bash(grep -A5 \"missing field \\\\`found_in_schema\\\\`\")"
+    ]
+  }
+}

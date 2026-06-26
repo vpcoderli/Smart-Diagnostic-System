@@ -48,6 +48,24 @@ pub struct ElkDeployment {
     pub field_message: Option<String>,
 }
 
+/// ES 直接连接部署配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EsDeployment {
+    pub address: String,
+    pub index_pattern: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub max_hits_per_trace: Option<usize>,
+    // 字段映射
+    pub field_timestamp: Option<String>,
+    pub field_level: Option<String>,
+    pub field_service: Option<String>,
+    pub field_trace_id: Option<String>,
+    pub field_message: Option<String>,
+}
+
 /// 定时任务配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,7 +93,12 @@ pub struct DeploymentManifest {
     #[serde(default)]
     pub elk: Option<ElkDeployment>,
     #[serde(default)]
+    pub es: Option<EsDeployment>,
+    #[serde(default)]
     pub schedule: Option<ScheduleDeployment>,
+    /// 用户最后选择的日志来源："elk" / "es" / "ssh"
+    #[serde(default)]
+    pub log_source: Option<String>,
 }
 
 /// 校验结果
@@ -325,6 +348,30 @@ pub fn manifest_to_collector_config(
             output_dir: "./diagnosis-output".into(),
         },
         elk: manifest.elk.as_ref().map(|e| ElkConfig {
+            address: e.address.clone(),
+            index_pattern: e.index_pattern.clone(),
+            username: e.username.clone(),
+            password: e.password.clone(),
+            timeout_secs: e.timeout_secs.unwrap_or(30),
+            max_hits_per_trace: e.max_hits_per_trace.unwrap_or(1000),
+            field_mapping: FieldMapping {
+                timestamp: e
+                    .field_timestamp
+                    .clone()
+                    .unwrap_or_else(|| "@timestamp".into()),
+                level: e.field_level.clone().unwrap_or_else(|| "level".into()),
+                service: e
+                    .field_service
+                    .clone()
+                    .unwrap_or_else(|| "serviceName".into()),
+                trace_id: e.field_trace_id.clone().unwrap_or_else(|| "traceId".into()),
+                message: e.field_message.clone().unwrap_or_else(|| "message".into()),
+                exception: "exception".into(),
+                stack_trace: "stackTrace".into(),
+                thread: "thread".into(),
+            },
+        }),
+        es: manifest.es.as_ref().map(|e| EsConfig {
             address: e.address.clone(),
             index_pattern: e.index_pattern.clone(),
             username: e.username.clone(),

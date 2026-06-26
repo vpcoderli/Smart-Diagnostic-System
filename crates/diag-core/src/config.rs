@@ -62,6 +62,36 @@ impl Default for ElkConfig {
     }
 }
 
+// ─── ES 直接连接配置 ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EsConfig {
+    pub address: String,
+    pub index_pattern: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_max_hits")]
+    pub max_hits_per_trace: usize,
+    #[serde(default)]
+    pub field_mapping: FieldMapping,
+}
+
+impl Default for EsConfig {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            index_pattern: "logstash-*".into(),
+            username: None,
+            password: None,
+            timeout_secs: 30,
+            max_hits_per_trace: 1000,
+            field_mapping: FieldMapping::default(),
+        }
+    }
+}
+
 // ─── Nacos 配置 ───
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -119,6 +149,8 @@ pub struct CollectorConfig {
     pub collector: CollectorSettings,
     #[serde(default)]
     pub elk: Option<ElkConfig>,
+    #[serde(default)]
+    pub es: Option<EsConfig>,
     #[serde(default)]
     pub nacos: Option<NacosConfig>,
     #[serde(default)]
