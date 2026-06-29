@@ -201,32 +201,73 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
 
     let parsed_url: url::Url = url.parse().map_err(|e| format!("URL 格式无效: {}", e))?;
 
-    let window = WebviewWindowBuilder::new(app, "diagnostic", WebviewUrl::External(parsed_url.clone()))
-        .title("🔍 诊断浏览器 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」")
+    // 事件驱动的兜底导航 + 仪表：
+    // Windows WebView2 在新建 webview 时，对外部 HTTP URL 的首次导航有时会被丢弃，
+    // 窗口回退到应用默认地址 tauri.localhost（收集端自己的前端），表现为空白页。
+    // 用 on_page_load 监听实际加载的地址：
+    //   1) 把真实加载的 URL 写到标题栏 —— 无需 devtools 即可判断窗口到底加载了什么；
+    //   2) 若落到非目标地址（host 不一致），用原生 navigate() 强制跳到目标一次。
+    // on_page_load 在事件循环线程触发，此时 webview 必然存活，导航最可靠，
+    // 且不依赖固定延时（虚拟机慢时固定 sleep 会过早执行而失效）。
+    let target = parsed_url.clone();
+    let target_host = parsed_url.host_str().map(|s| s.to_string());
+    let friendly_title = "🔍 诊断浏览器 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
+    let redirected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let _window = WebviewWindowBuilder::new(app, "diagnostic", WebviewUrl::External(parsed_url.clone()))
+        .title(friendly_title)
         .inner_size(1280.0, 900.0)
         .center()
         .initialization_script(DIAGNOSTIC_JS)
         .devtools(true)
+        .on_navigation(|u| {
+            tracing::info!("诊断窗口 on_navigation -> {}", u);
+            true
+        })
+        .on_page_load(move |window, payload| {
+            let loaded = payload.url().clone();
+            tracing::info!("诊断窗口 on_page_load [{:?}] -> {}", payload.event(), loaded);
+            let host_mismatch = loaded.host_str().map(|s| s.to_string()) != target_host;
+            if host_mismatch {
+                // 仍未到目标地址：标题暴露真实地址，并强制导航一次
+                let _ = window.set_title(&format!("诊断浏览器 [加载: {}]", loaded));
+                if !redirected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    tracing::warn!("诊断窗口落到非目标地址 {}，强制导航到 {}", loaded, target);
+                    let _ = window.navigate(target.clone());
+                }
+            } else {
+                // 已在目标页：恢复友好标题
+                let _ = window.set_title(friendly_title);
+            }
+        })
         .build()
         .map_err(|e| format!("创建诊断窗口失败: {}", e))?;
 
-    // Windows WebView2 在新建 webview 时，对外部 HTTP URL 的首次导航会被丢弃，
-    // 窗口回退到应用默认地址 tauri.localhost（即收集端自己的前端），出现空白页。
-    // 解决方案：webview 就绪后用原生 navigate() 显式导航到目标 URL（走 WebView2
-    // 原生 Navigate 通道，比 eval 注入 JS 可靠，不会因 webview 未就绪被静默丢弃）。
-    #[cfg(target_os = "windows")]
+    // 延时兜底：若 on_page_load 因外部导航被静默取消而从未触发，
+    // 这个线程在 1.5s（虚拟机较慢，留足初始化时间）后检查当前地址，
+    // 发现仍未到目标 host 就再强制导航一次。与 on_page_load 兜底互补：
+    //   - on_page_load 处理「加载了错误地址（tauri.localhost）」
+    //   - 此线程处理「什么都没加载（外部首跳被取消）」
     {
-        let wnd = window.clone();
+        let wnd = _window.clone();
         let nav_url = parsed_url.clone();
+        let want_host = parsed_url.host_str().map(|s| s.to_string());
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Err(e) = wnd.navigate(nav_url) {
-                tracing::warn!("Windows 诊断浏览器导航失败: {}", e);
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let cur_host = wnd.url().ok().and_then(|u| u.host_str().map(|s| s.to_string()));
+            if cur_host != want_host {
+                tracing::warn!(
+                    "诊断窗口延时检查：当前 host={:?}，目标 host={:?}，强制导航",
+                    cur_host, want_host
+                );
+                if let Err(e) = wnd.navigate(nav_url) {
+                    tracing::warn!("诊断窗口延时强制导航失败: {}", e);
+                }
+            } else {
+                tracing::info!("诊断窗口延时检查：已在目标 host，无需干预");
             }
         });
     }
-    #[cfg(not(target_os = "windows"))]
-    let _ = window;
 
     tracing::info!("诊断浏览器已打开: {}", url);
     Ok(())
