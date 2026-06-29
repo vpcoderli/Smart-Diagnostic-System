@@ -155,6 +155,7 @@ pub fn run() {
             get_capture_count,
             reset_capture_data,
             close_diag_browser,
+            open_diag_devtools,
             resolve_request_url,
             start_diagnosis,
             get_config_summary,

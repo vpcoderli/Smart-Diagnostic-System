@@ -923,6 +923,7 @@ function initPhase4() {
   document.getElementById('btn-capture-done').addEventListener('click', stopCapture);
   document.getElementById('btn-reset-capture').addEventListener('click', resetCapture);
   document.getElementById('btn-close-browser').addEventListener('click', closeDiagBrowser);
+  document.getElementById('btn-diag-devtools').addEventListener('click', openDiagDevtools);
   document.getElementById('btn-new-diag').addEventListener('click', resetRealtime);
 
   // History
@@ -1037,6 +1038,14 @@ async function closeDiagBrowser() {
   state.diagBrowserOpen = false;
   document.getElementById('capture-dot').className = 'status-dot idle';
   document.getElementById('capture-indicator').textContent = '抓包已停止';
+}
+
+async function openDiagDevtools() {
+  try {
+    await invoke('open_diag_devtools', {});
+  } catch (err) {
+    showToast('开发者工具打开失败: ' + err, 'error');
+  }
 }
 
 async function resetCapture() {

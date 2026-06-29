@@ -18,7 +18,7 @@
     ]
   },
   "bundle": {
-    "active": true,
+    "active": false,
     "targets": "all",
     "icon": []
   }

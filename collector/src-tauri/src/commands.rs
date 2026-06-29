@@ -651,6 +651,12 @@ pub fn close_diag_browser(app: tauri::AppHandle) -> String {
     "诊断浏览器已关闭".to_string()
 }
 
+/// 打开诊断浏览器的开发者工具（调试用）
+#[tauri::command]
+pub fn open_diag_devtools(app: tauri::AppHandle) -> Result<(), String> {
+    crate::webview_capture::open_diagnostic_devtools(&app)
+}
+
 /// 解析单个 Request URL
 #[tauri::command]
 pub fn resolve_request_url(url: String, gateway_prefix: String) -> Result<ResolvedUrl, String> {

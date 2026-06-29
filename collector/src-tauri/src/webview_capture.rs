@@ -234,3 +234,12 @@ pub fn close_diagnostic_window(app: &AppHandle) {
         tracing::info!("诊断浏览器已关闭");
     }
 }
+
+/// 打开诊断窗口的开发者工具（用于调试空白页等问题）
+pub fn open_diagnostic_devtools(app: &AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("diagnostic")
+        .ok_or("诊断浏览器未打开，请先点击「打开诊断浏览器」")?;
+    window.open_devtools();
+    Ok(())
+}
