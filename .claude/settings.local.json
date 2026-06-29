@@ -32,7 +32,9 @@
       "Bash(cargo check *)",
       "Bash(node --check collector/src/app.js)",
       "Bash(kill %1)",
-      "Bash(pkill -f \"cargo tauri dev\")"
+      "Bash(pkill -f \"cargo tauri dev\")",
+      "Bash(git add *)",
+      "Bash(git commit *)"
     ]
   }
 }
