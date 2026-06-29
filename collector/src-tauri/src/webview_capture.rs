@@ -210,21 +210,23 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
         .build()
         .map_err(|e| format!("创建诊断窗口失败: {}", e))?;
 
-    // Windows WebView2 在创建外部 URL 窗口时，会先导航到 tauri://localhost/ 做
-    // IPC 初始化，导致外部 URL 的跳转被覆盖，出现空白页。
-    // 解决方案：等 WebView2 初始化完成后，强制用 JS 跳转到目标 URL。
+    // Windows WebView2 在新建 webview 时，对外部 HTTP URL 的首次导航会被丢弃，
+    // 窗口回退到应用默认地址 tauri.localhost（即收集端自己的前端），出现空白页。
+    // 解决方案：webview 就绪后用原生 navigate() 显式导航到目标 URL（走 WebView2
+    // 原生 Navigate 通道，比 eval 注入 JS 可靠，不会因 webview 未就绪被静默丢弃）。
     #[cfg(target_os = "windows")]
     {
         let wnd = window.clone();
-        let nav_url = parsed_url.to_string();
+        let nav_url = parsed_url.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            let js = format!("window.location.replace({:?})", nav_url);
-            if let Err(e) = wnd.eval(&js) {
-                tracing::warn!("Windows 诊断浏览器强制跳转失败: {}", e);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Err(e) = wnd.navigate(nav_url) {
+                tracing::warn!("Windows 诊断浏览器导航失败: {}", e);
             }
         });
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
 
     tracing::info!("诊断浏览器已打开: {}", url);
     Ok(())
