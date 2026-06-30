@@ -69,6 +69,56 @@ fn read_collected_diag_data(
         .and_then(|title| extract_diag_data_from_title(&title))
 }
 
+fn request_matches_gateway_prefix(raw_url: &str, gateway_prefix: &str) -> bool {
+    let prefix = gateway_prefix.trim_end_matches('/');
+    if prefix.is_empty() || prefix == "/" {
+        return true;
+    }
+
+    let Ok(url) = url::Url::parse(raw_url) else {
+        return false;
+    };
+    let path = url.path();
+    path == prefix || path.starts_with(&format!("{}/", prefix))
+}
+
+fn filter_captured_page_to_gateway_scope(
+    mut captured: CapturedPage,
+    gateway_prefix: &str,
+) -> CapturedPage {
+    captured
+        .requests
+        .retain(|request| request_matches_gateway_prefix(&request.url, gateway_prefix));
+    captured
+}
+
+fn summarize_captured_services(
+    captured: &CapturedPage,
+    gateway_prefix: &str,
+) -> Vec<serde_json::Value> {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for request in &captured.requests {
+        if !request_matches_gateway_prefix(&request.url, gateway_prefix) {
+            continue;
+        }
+        if let Ok(resolved) = url_resolver::resolve_url(&request.url, gateway_prefix) {
+            if !resolved.service.is_empty() && resolved.service != "unknown" {
+                *counts.entry(resolved.service).or_default() += 1;
+            }
+        }
+    }
+
+    counts
+        .into_iter()
+        .map(|(name, request_count)| {
+            serde_json::json!({
+                "name": name,
+                "requestCount": request_count,
+            })
+        })
+        .collect()
+}
+
 // ═══════════════════════════════════════
 // 第一步：部署文档导入
 // ═══════════════════════════════════════
@@ -582,6 +632,11 @@ pub async fn get_capture_count(
     app: tauri::AppHandle,
 ) -> Result<usize, String> {
     use tauri::Manager;
+    let current = *count.lock().unwrap();
+    if current > 0 {
+        return Ok(current);
+    }
+
     if let Some(window) = app.get_webview_window("diagnostic") {
         if let Ok(title) = window.title() {
             if let Some(n) = extract_diag_count_from_title(&title) {
@@ -819,15 +874,9 @@ pub async fn start_diagnosis(
 
     let captured: CapturedPage =
         serde_json::from_str(&captured_json).map_err(|e| format!("解析捕获数据失败: {}", e))?;
+    let captured = filter_captured_page_to_gateway_scope(captured, &config.gateway.prefix);
 
-    let services: Vec<String> = captured
-        .requests
-        .iter()
-        .filter_map(|r| url_resolver::resolve_url(&r.url, &config.gateway.prefix).ok())
-        .map(|r| r.service)
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
+    let services = summarize_captured_services(&captured, &config.gateway.prefix);
 
     let source = log_source.unwrap_or_else(|| "elk".to_string());
     tracing::info!(
@@ -2433,7 +2482,11 @@ pub fn open_output_dir(path: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_diag_count_from_title, extract_diag_data_from_title, source_supports_mode};
+    use super::{
+        extract_diag_count_from_title, extract_diag_data_from_title,
+        filter_captured_page_to_gateway_scope, source_supports_mode, summarize_captured_services,
+    };
+    use diag_core::models::{CapturedPage, CapturedRequest};
 
     #[test]
     fn realtime_supports_all_three_sources() {
@@ -2498,5 +2551,59 @@ mod tests {
         assert_eq!(extract_diag_count_from_title("诊断浏览器 [DIAG:0]"), Some(0));
         assert_eq!(extract_diag_count_from_title("诊断浏览器"), None);
         assert_eq!(extract_diag_count_from_title("[DIAG:abc] 页面"), None);
+    }
+
+    #[test]
+    fn summarize_captured_services_returns_request_counts_for_result_card() {
+        let captured = CapturedPage {
+            page_url: "http://host/app".to_string(),
+            requests: vec![
+                request("http://host/gateway/pcm-management/api/a"),
+                request("http://host/gateway/pcm-management/api/b"),
+                request("http://host/gateway/user-center/login"),
+                request("http://host/not-gateway/static"),
+            ],
+        };
+
+        let services = summarize_captured_services(&captured, "/gateway");
+
+        assert_eq!(services[0]["name"], "pcm-management");
+        assert_eq!(services[0]["requestCount"], 2);
+        assert_eq!(services[1]["name"], "user-center");
+        assert_eq!(services[1]["requestCount"], 1);
+        assert_eq!(services.len(), 2);
+    }
+
+    #[test]
+    fn filter_captured_page_to_gateway_scope_drops_non_api_page_requests() {
+        let captured = CapturedPage {
+            page_url: "http://host/app".to_string(),
+            requests: vec![
+                request("http://host/gateway/pcm-management/api/a"),
+                request("http://host/not-gateway/static"),
+                request("http://host/gateway/user-center/login"),
+            ],
+        };
+
+        let filtered = filter_captured_page_to_gateway_scope(captured, "/gateway");
+
+        assert_eq!(filtered.requests.len(), 2);
+        assert!(filtered
+            .requests
+            .iter()
+            .all(|req| req.url.contains("/gateway/")));
+    }
+
+    fn request(url: &str) -> CapturedRequest {
+        CapturedRequest {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            status: 200,
+            duration_ms: 10,
+            trace_id: None,
+            timestamp: "2026-06-30T00:00:00Z".to_string(),
+            request_type: "xhr".to_string(),
+            response_size: None,
+        }
     }
 }

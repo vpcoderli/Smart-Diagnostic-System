@@ -116,7 +116,7 @@ pub fn run() {
                     .and_then(|v| v.as_u64())
                     .or_else(|| payload.as_u64());
                 if let Some(count) = count.and_then(|n| usize::try_from(n).ok()) {
-                    tracing::info!("诊断事件更新计数: {}", count);
+                    tracing::debug!("诊断事件更新计数: {}", count);
                     *count_store.lock().unwrap() = count;
                 }
             });

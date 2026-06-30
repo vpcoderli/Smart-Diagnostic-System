@@ -37,7 +37,16 @@ impl CapturedDataStore {
         if data.len() > MAX_CAPTURE_PAYLOAD_CHARS {
             return Err(format!("诊断数据过大: {} chars", data.len()));
         }
-        *self.data.lock().unwrap() = Some(data);
+        let incoming_count = captured_request_count(&data);
+        let mut stored = self.data.lock().unwrap();
+        let stored_count = stored
+            .as_deref()
+            .and_then(captured_request_count)
+            .unwrap_or(0);
+        if incoming_count == Some(0) && stored_count > 0 {
+            return Ok(());
+        }
+        *stored = Some(data);
         Ok(())
     }
 
@@ -93,6 +102,14 @@ impl CapturedDataStore {
     }
 }
 
+fn captured_request_count(data: &str) -> Option<usize> {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()?
+        .get("requests")?
+        .as_array()
+        .map(|requests| requests.len())
+}
+
 /// 诊断 JS 注入脚本 —— 拦截 XHR 和 fetch API 请求（过滤静态资源）
 const DIAGNOSTIC_JS: &str = r#"
 (function() {
@@ -120,6 +137,16 @@ const DIAGNOSTIC_JS: &str = r#"
   var _origTitle = document.title || '';
   var _lastReportedCount = null;
 
+  function _newSessionId() {
+    return 'session-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+  }
+
+  window.__diag_capture_session_id = window.__diag_capture_session_id || _newSessionId();
+  window.__diag_capture_started_at = window.__diag_capture_started_at || Date.now();
+  window.__diag_capture_started_perf = window.__diag_capture_started_perf == null
+    ? performance.now()
+    : window.__diag_capture_started_perf;
+
   // ═══ 静态资源过滤 ═══
   var _staticExts = /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i;
   function _isStaticResource(url) {
@@ -142,6 +169,13 @@ const DIAGNOSTIC_JS: &str = r#"
       req.timestamp || '',
       req.requestType || ''
     ].join('|');
+  }
+
+  function _belongsToCurrentSession(req) {
+    if (!req) return false;
+    if (req.__diag_session_id && req.__diag_session_id !== window.__diag_capture_session_id) return false;
+    if (req.capturedAtMs && req.capturedAtMs < window.__diag_capture_started_at) return false;
+    return true;
   }
 
   function _emitToRust(eventName, payload) {
@@ -182,12 +216,14 @@ const DIAGNOSTIC_JS: &str = r#"
       entries.forEach(function(entry) {
         var initiator = entry.initiatorType || 'performance';
         if (initiator !== 'fetch' && initiator !== 'xmlhttprequest' && initiator !== 'beacon') return;
+        if (entry.startTime < window.__diag_capture_started_perf) return;
         if (!_shouldCapture(entry.name)) return;
         if (skipUrls && skipUrls[entry.name]) return;
         var startedAt = Date.now();
         if (performance.timeOrigin && entry.startTime != null) {
           startedAt = Math.round(performance.timeOrigin + entry.startTime);
         }
+        if (startedAt < window.__diag_capture_started_at) return;
         requests.push({
           method: 'GET',
           url: entry.name,
@@ -196,7 +232,9 @@ const DIAGNOSTIC_JS: &str = r#"
           traceId: null,
           timestamp: new Date(startedAt).toISOString(),
           requestType: initiator,
-          responseSize: entry.transferSize || entry.encodedBodySize || entry.decodedBodySize || null
+          responseSize: entry.transferSize || entry.encodedBodySize || entry.decodedBodySize || null,
+          capturedAtMs: startedAt,
+          __diag_session_id: window.__diag_capture_session_id
         });
       });
     } catch(e) {}
@@ -208,6 +246,7 @@ const DIAGNOSTIC_JS: &str = r#"
     var skipUrls = {};
     var all = [];
     (window.__diag_requests || []).forEach(function(req) {
+      if (!_belongsToCurrentSession(req)) return;
       var key = _requestKey(req);
       if (req && req.url) skipUrls[req.url] = true;
       if (!seen[key]) {
@@ -233,6 +272,12 @@ const DIAGNOSTIC_JS: &str = r#"
 
   function _mergeFramePayload(payload) {
     if (!_isTop || !payload) return;
+    if (payload.sessionStartedAt && payload.sessionStartedAt < window.__diag_capture_started_at) return;
+    if (
+      payload.sessionId &&
+      payload.sessionId !== window.__diag_capture_session_id &&
+      (!payload.sessionStartedAt || payload.sessionStartedAt < window.__diag_capture_started_at)
+    ) return;
     _ensureTopStores();
     var frameId = payload.frameId || 'unknown';
     window.__diag_frame_requests[frameId] = Array.isArray(payload.requests) ? payload.requests : [];
@@ -287,7 +332,9 @@ const DIAGNOSTIC_JS: &str = r#"
       type: _frameMessageType,
       frameId: _frameId,
       pageUrl: window.__diag_page_url || location.href,
-      requests: window.__diag_requests || []
+      requests: (window.__diag_requests || []).filter(_belongsToCurrentSession),
+      sessionId: window.__diag_capture_session_id,
+      sessionStartedAt: window.__diag_capture_started_at
     };
 
     if (_isTop) {
@@ -301,7 +348,12 @@ const DIAGNOSTIC_JS: &str = r#"
     } catch(e) {}
   }
 
-  function _resetLocalCapture() {
+  function _resetLocalCapture(session) {
+    session = session || {};
+    window.__diag_capture_session_id = session.sessionId || _newSessionId();
+    window.__diag_capture_started_at = session.sessionStartedAt || Date.now();
+    window.__diag_capture_started_perf = performance.now();
+    _lastReportedCount = null;
     window.__diag_requests = [];
     window.__diag_page_url = location.href;
     try { performance.clearResourceTimings(); } catch(e) {}
@@ -316,7 +368,11 @@ const DIAGNOSTIC_JS: &str = r#"
     if (!_isTop) return;
     for (var i = 0; i < window.frames.length; i++) {
       try {
-        window.frames[i].postMessage({ type: _resetMessageType }, '*');
+        window.frames[i].postMessage({
+          type: _resetMessageType,
+          sessionId: window.__diag_capture_session_id,
+          sessionStartedAt: window.__diag_capture_started_at
+        }, '*');
       } catch(e) {}
     }
   }
@@ -335,7 +391,7 @@ const DIAGNOSTIC_JS: &str = r#"
       var data = event && event.data;
       if (!data || typeof data !== 'object') return;
       if (data.type === _resetMessageType) {
-        window.__resetDiagCapture();
+        _resetLocalCapture(data);
         return;
       }
       if (!_isTop) return;
@@ -348,7 +404,9 @@ const DIAGNOSTIC_JS: &str = r#"
           _mergeFramePayload({
             frameId: data.frameId,
             pageUrl: parsed.pageUrl,
-            requests: parsed.requests
+            requests: parsed.requests,
+            sessionId: data.sessionId,
+            sessionStartedAt: data.sessionStartedAt
           });
         } catch(e) {}
         window.__sendDiagData();
@@ -378,7 +436,9 @@ const DIAGNOSTIC_JS: &str = r#"
           traceId: resp.headers.get('x-trace') || resp.headers.get('x-trace-id') || resp.headers.get('traceparent') || null,
           timestamp: new Date().toISOString(),
           requestType: 'fetch',
-          responseSize: size
+          responseSize: size,
+          capturedAtMs: Date.now(),
+          __diag_session_id: window.__diag_capture_session_id
         });
         _notifyCount();
       }
@@ -394,7 +454,9 @@ const DIAGNOSTIC_JS: &str = r#"
           traceId: null,
           timestamp: new Date().toISOString(),
           requestType: 'fetch',
-          responseSize: null
+          responseSize: null,
+          capturedAtMs: Date.now(),
+          __diag_session_id: window.__diag_capture_session_id
         });
         _notifyCount();
       }
@@ -439,7 +501,9 @@ const DIAGNOSTIC_JS: &str = r#"
           traceId: traceId,
           timestamp: new Date().toISOString(),
           requestType: 'xhr',
-          responseSize: size
+          responseSize: size,
+          capturedAtMs: Date.now(),
+          __diag_session_id: window.__diag_capture_session_id
         });
         _notifyCount();
       });
@@ -455,6 +519,10 @@ const DIAGNOSTIC_JS: &str = r#"
     });
   };
 
+  window.__getDiagCount = function() {
+    return (_isTop ? _allRequests() : _localRequestsWithPerformance()).length;
+  };
+
   // ═══ 发送采集数据到 Rust 后端 ═══
   window.__sendDiagData = function() {
     var data = window.__getDiagData();
@@ -466,7 +534,9 @@ const DIAGNOSTIC_JS: &str = r#"
         window.top.postMessage({
           type: _dataMessageType,
           frameId: _frameId,
-          data: data
+          data: data,
+          sessionId: window.__diag_capture_session_id,
+          sessionStartedAt: window.__diag_capture_started_at
         }, '*');
       }
     } catch(e) {}
@@ -518,30 +588,6 @@ const DIAGNOSTIC_JS: &str = r#"
 pub(crate) const FORCE_DIAGNOSTIC_COUNT_JS: &str = r#"
 (function() {
   try {
-    function isStatic(url) {
-      try {
-        var u = new URL(url, location.href);
-        return /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i.test(u.pathname);
-      } catch(e) { return false; }
-    }
-    function shouldCapture(url) {
-      return !!url && url.indexOf('diag://') !== 0 && !isStatic(url);
-    }
-    function perfCount() {
-      var urls = {};
-      (window.__diag_requests || []).forEach(function(req) {
-        if (req && req.url) urls[req.url] = true;
-      });
-      try {
-        (performance.getEntriesByType('resource') || []).forEach(function(entry) {
-          var t = entry.initiatorType || '';
-          if ((t === 'fetch' || t === 'xmlhttprequest' || t === 'beacon') && shouldCapture(entry.name)) {
-            urls[entry.name] = true;
-          }
-        });
-      } catch(e) {}
-      return Object.keys(urls).length;
-    }
     function sendCount(count) {
       try {
         var eventApi = window.__TAURI__ && window.__TAURI__.event;
@@ -559,7 +605,7 @@ pub(crate) const FORCE_DIAGNOSTIC_COUNT_JS: &str = r#"
         document.title = '[DIAG:' + count + '] ' + String(document.title || '').replace(/^\[DIAG:\d+\]\s*/, '');
       } catch(e) {}
     }
-    sendCount(perfCount());
+    sendCount(window.__getDiagCount ? window.__getDiagCount() : ((window.__diag_requests || []).length));
   } catch(e) {}
 })();
 "#;
@@ -567,57 +613,15 @@ pub(crate) const FORCE_DIAGNOSTIC_COUNT_JS: &str = r#"
 pub(crate) const FORCE_DIAGNOSTIC_SNAPSHOT_JS: &str = r#"
 (function() {
   try {
-    function isStatic(url) {
-      try {
-        var u = new URL(url, location.href);
-        return /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i.test(u.pathname);
-      } catch(e) { return false; }
-    }
-    function shouldCapture(url) {
-      return !!url && url.indexOf('diag://') !== 0 && !isStatic(url);
-    }
-    function key(req) {
-      return [req.method || '', req.url || '', req.status == null ? '' : String(req.status), req.timestamp || '', req.requestType || ''].join('|');
-    }
-    function pushUnique(all, seen, req) {
-      var k = key(req);
-      if (!seen[k]) {
-        seen[k] = true;
-        all.push(req);
-      }
-    }
-    var all = [];
-    var seen = {};
-    var skipUrls = {};
-    (window.__diag_requests || []).forEach(function(req) {
-      if (req && req.url) skipUrls[req.url] = true;
-      pushUnique(all, seen, req);
-    });
-    try {
-      (performance.getEntriesByType('resource') || []).forEach(function(entry) {
-        var initiator = entry.initiatorType || 'performance';
-        if (initiator !== 'fetch' && initiator !== 'xmlhttprequest' && initiator !== 'beacon') return;
-        if (!shouldCapture(entry.name) || skipUrls[entry.name]) return;
-        var startedAt = Date.now();
-        if (performance.timeOrigin && entry.startTime != null) {
-          startedAt = Math.round(performance.timeOrigin + entry.startTime);
-        }
-        pushUnique(all, seen, {
-          method: 'GET',
-          url: entry.name,
-          status: entry.responseStatus || 0,
-          durationMs: Math.max(0, Math.round(entry.duration || 0)),
-          traceId: null,
-          timestamp: new Date(startedAt).toISOString(),
-          requestType: initiator,
-          responseSize: entry.transferSize || entry.encodedBodySize || entry.decodedBodySize || null
+    var data = window.__getDiagData
+      ? window.__getDiagData()
+      : JSON.stringify({
+          pageUrl: window.__diag_page_url || location.href,
+          requests: window.__diag_requests || []
         });
-      });
-    } catch(e) {}
-    var data = JSON.stringify({
-      pageUrl: window.__diag_page_url || location.href,
-      requests: all
-    });
+    var parsed = { requests: [] };
+    try { parsed = JSON.parse(data); } catch(e) {}
+    var count = Array.isArray(parsed.requests) ? parsed.requests.length : 0;
     try {
       var eventApi = window.__TAURI__ && window.__TAURI__.event;
       if (eventApi && typeof eventApi.emit === 'function') {
@@ -629,7 +633,7 @@ pub(crate) const FORCE_DIAGNOSTIC_SNAPSHOT_JS: &str = r#"
           try { console.warn('[Smart-Diag] 快照事件回传失败:', e); } catch(_) {}
         });
         eventApi.emit('smart-diag-capture-count', {
-          value: all.length,
+          value: count,
           pageUrl: window.__diag_page_url || location.href,
           t: Date.now()
         }).catch(function(e) {
@@ -782,6 +786,28 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_scripts_scope_counts_and_snapshots_to_active_capture_session() {
+        assert!(super::DIAGNOSTIC_JS.contains("__diag_capture_session_id"));
+        assert!(super::DIAGNOSTIC_JS.contains("__diag_capture_started_at"));
+        assert!(super::DIAGNOSTIC_JS.contains("__diag_capture_started_perf"));
+        assert!(super::DIAGNOSTIC_JS.contains("req.__diag_session_id"));
+        assert!(super::DIAGNOSTIC_JS.contains("payload.sessionId"));
+        assert!(super::DIAGNOSTIC_JS.contains("payload.sessionStartedAt"));
+        assert!(
+            super::DIAGNOSTIC_JS.contains("entry.startTime < window.__diag_capture_started_perf")
+        );
+        assert!(super::DIAGNOSTIC_JS.contains("window.__getDiagCount"));
+        assert!(
+            super::FORCE_DIAGNOSTIC_COUNT_JS.contains("window.__getDiagCount"),
+            "轮询计数应读取注入脚本的会话计数，不能重新扫描整个 performance timeline"
+        );
+        assert!(
+            super::FORCE_DIAGNOSTIC_SNAPSHOT_JS.contains("window.__getDiagData"),
+            "强制快照应复用注入脚本聚合后的 frame 数据，不能用顶层空快照覆盖完整数据"
+        );
+    }
+
+    #[test]
     fn diagnostic_capability_allows_remote_event_emit_only() {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/diagnostic.json")).unwrap();
@@ -831,6 +857,25 @@ mod tests {
             store.data.lock().unwrap().as_deref(),
             Some(r#"{"pageUrl":"http://host","requests":[]}"#)
         );
+    }
+
+    #[test]
+    fn captured_store_keeps_non_empty_payload_when_late_empty_snapshot_arrives() {
+        let store = super::CapturedDataStore::default();
+
+        store
+            .store_data(
+                r#"{"pageUrl":"http://host","requests":[{"method":"GET","url":"http://host/gateway/pcm/a","status":200,"durationMs":10,"timestamp":"2026-06-30T00:00:00Z"}]}"#
+                    .to_string(),
+            )
+            .unwrap();
+        store
+            .store_data(r#"{"pageUrl":"http://host","requests":[]}"#.to_string())
+            .unwrap();
+
+        let stored = store.data.lock().unwrap().clone().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(value["requests"].as_array().unwrap().len(), 1);
     }
 }
 

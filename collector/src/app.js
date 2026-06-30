@@ -1074,7 +1074,8 @@ async function stopCapture() {
 
   try {
     const capturedJson = await invoke('collect_diag_data', {});
-    const capturedData = JSON.parse(capturedJson);
+    const gatewayPrefix = document.getElementById('gateway-prefix').value.trim() || '/gateway';
+    const capturedData = filterCapturedDataByGateway(JSON.parse(capturedJson), gatewayPrefix);
 
     if (!capturedData.requests || capturedData.requests.length === 0) {
       showToast('未捕获到请求，请在诊断浏览器内操作页面', 'error');
@@ -1083,7 +1084,6 @@ async function stopCapture() {
     }
 
     state.capturedRequests = capturedData.requests;
-    const gatewayPrefix = document.getElementById('gateway-prefix').value.trim() || '/gateway';
 
     const tbody = document.getElementById('req-tbody');
     tbody.innerHTML = '';
@@ -1103,11 +1103,28 @@ async function stopCapture() {
     document.getElementById('capture-card').style.display = 'none';
     document.getElementById('progress-card').style.display = 'block';
 
-    await runDiagnosis(capturedJson);
+    await runDiagnosis(JSON.stringify(capturedData));
   } catch (err) {
     showToast('读取抓包数据失败: ' + err, 'error');
     btn.disabled = false;
   }
+}
+
+function filterCapturedDataByGateway(capturedData, gatewayPrefix) {
+  const prefix = (gatewayPrefix || '').replace(/\/+$/, '');
+  if (!prefix || prefix === '/') return capturedData;
+  const requests = Array.isArray(capturedData.requests) ? capturedData.requests : [];
+  return {
+    ...capturedData,
+    requests: requests.filter(req => {
+      try {
+        const pathname = new URL(req.url).pathname;
+        return pathname === prefix || pathname.startsWith(prefix + '/');
+      } catch {
+        return false;
+      }
+    }),
+  };
 }
 
 function parseRequestUrl(url, gatewayPrefix) {
