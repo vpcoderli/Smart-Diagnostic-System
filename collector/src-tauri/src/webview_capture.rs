@@ -215,24 +215,43 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
     let parsed_url: url::Url = url.parse().map_err(|e| format!("URL 格式无效: {}", e))?;
 
     // 版本标记：用于在标题栏肉眼确认运行的是最新二进制（排除旧安装包干扰）。
-    const NAV_TAG: &str = "v6";
+    const NAV_TAG: &str = "v7";
     let friendly_title =
-        "🔍 诊断浏览器【v6】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
+        "🔍 诊断浏览器【v7】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
     let target_host = parsed_url.host_str().map(|s| s.to_string());
 
-    // ── 核心修复：自跳转注入脚本 ──
+    // ── 核心修复：自跳转注入脚本（延迟 + 轮询重试）──
     // 实测结论：Windows 上 Rust→webview 的 navigate()/eval() 消息通道对该诊断窗口
-    // 失效 —— 窗口始终停在 app 自身地址 tauri.localhost。但用户手动在控制台执行
-    // location.replace 是成功的，即「页内导航」可靠。
-    // 这里把跳转逻辑写进 initialization_script —— 它经 WebView2 的
-    // AddScriptToExecuteOnDocumentCreated 在每个新文档自动执行，完全不经过那个失效
-    // 的 Rust→webview 通道。页面一旦发现自己停在 app 壳（tauri.localhost / tauri: /
-    // about:blank）就自行 location.replace 到目标地址。到达目标页后该守卫为假，不再
-    // 跳转，抓包脚本正常运行。
+    // 失效（窗口始终停在 app 壳 tauri.localhost），但用户手动在控制台执行
+    // location.replace 成功 —— 即「页内导航」可靠，区别只在时机。
+    // 注入脚本经 AddScriptToExecuteOnDocumentCreated 在文档「刚创建」的极早期运行，
+    // 此时直接 location.replace 会被丢弃。故改为：发现自己在 app 壳就用 setInterval
+    // 反复尝试 location.replace，直到真正跳离 app 壳（或超过重试上限）。一旦到达目标
+    // 页，守卫为假，不再跳转，抓包脚本正常运行。整个过程在页面内完成，不经任何
+    // Rust→webview 通道。
     let redirect_prelude = format!(
-        "(function(){{try{{var h=location.hostname,p=location.protocol,u=location.href;\
-if(h==='tauri.localhost'||p==='tauri:'||u==='about:blank'||u===''){{location.replace({:?});}}}}\
-catch(e){{}}}})();\n",
+        r#"(function(){{
+  var TARGET = {:?};
+  function onShell() {{
+    try {{
+      var h = location.hostname, p = location.protocol, u = location.href;
+      return (h === 'tauri.localhost' || p === 'tauri:' || u === 'about:blank' || u === '');
+    }} catch(e) {{ return true; }}
+  }}
+  if (!onShell()) return;            // 已在目标页：交给抓包脚本，不跳转
+  function go() {{ try {{ if (onShell()) location.replace(TARGET); }} catch(e) {{}} }}
+  var n = 0;
+  var timer = setInterval(function() {{
+    n++;
+    if (!onShell() || n > 50) {{ clearInterval(timer); return; }}
+    go();
+  }}, 150);
+  // 文档就绪后也各试一次，覆盖不同时机
+  try {{ document.addEventListener('DOMContentLoaded', go); }} catch(e) {{}}
+  try {{ window.addEventListener('load', go); }} catch(e) {{}}
+  setTimeout(go, 60);
+}})();
+"#,
         parsed_url.as_str()
     );
     let init_script = format!("{}{}", redirect_prelude, DIAGNOSTIC_JS);
