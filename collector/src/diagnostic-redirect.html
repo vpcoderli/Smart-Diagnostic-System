@@ -2,29 +2,97 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>诊断浏览器</title>
-<script>
-// initialization_script 在此页加载前设置 window.__DIAG_TARGET__，
-// 本脚本作为普通页面脚本读取并执行跳转（与用户手动控制台等价，无 WebView2 限制）。
-(function () {
-  function go() {
-    var url = window.__DIAG_TARGET__;
-    if (url) {
-      window.location.replace(url);
-    } else {
-      // 极少数情况下 init script 还没跑完，稍后重试
-      setTimeout(go, 30);
-    }
+<title>诊断浏览器 v9</title>
+<style>
+  html, body {
+    background: #11131f; color: #e6e8ef; margin: 0; height: 100%;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
   }
+  .wrap {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100vh; gap: 22px; padding: 24px; box-sizing: border-box;
+  }
+  .ver {
+    position: fixed; top: 10px; left: 14px;
+    font-size: 13px; color: #6cf; letter-spacing: 1px; font-weight: bold;
+  }
+  .title { font-size: 20px; font-weight: 600; }
+  .gobtn {
+    display: inline-block; background: #4a7cff; color: #fff !important;
+    text-decoration: none; padding: 18px 44px; border-radius: 10px;
+    font-size: 19px; font-weight: 700; cursor: pointer; border: none;
+    box-shadow: 0 4px 14px rgba(74,124,255,.4);
+  }
+  .gobtn:hover { background: #3a6cef; }
+  .url {
+    color: #8ab4ff; font-size: 13px; word-break: break-all;
+    max-width: 80%; text-align: center; line-height: 1.5;
+  }
+  .hint { color: #8890a6; font-size: 13px; text-align: center; }
+  #status { color: #c0c6d8; font-size: 15px; }
+</style>
+</head>
+<body>
+  <div class="ver">DIAG v9</div>
+  <div class="wrap">
+    <div class="title">🔍 诊断浏览器</div>
+    <div id="status">正在自动打开诊断页面…</div>
+    <a id="gobtn" class="gobtn" href="#" rel="noopener" style="display:none">🔗 点击进入诊断页面</a>
+    <div class="url" id="urlText"></div>
+    <div class="hint">若页面未自动跳转，请点击上方蓝色按钮进入</div>
+  </div>
+<script>
+(function () {
+  // initialization_script 已在本页加载前设置 window.__DIAG_TARGET__。
+  // 本脚本是「普通页面脚本」，与用户在 DevTools 控制台执行同一上下文 —— 拥有完整
+  // 导航权限，不受 WebView2 对 init script 的跨源导航限制。
+  var attempts = 0;
+
+  function ready(t) {
+    var btn = document.getElementById('gobtn');
+    var urlText = document.getElementById('urlText');
+    btn.href = t;
+    btn.style.display = 'inline-block';
+    urlText.textContent = t;
+    // 点击 = 真实用户手势导航，必定生效（与控制台等价）
+    btn.addEventListener('click', function (e) {
+      e.preventDefault();
+      try { window.location.href = t; } catch (err) {}
+    });
+    // 先自动尝试（多数情况下足够）
+    autoGo(t);
+  }
+
+  function autoGo(t) {
+    try { window.location.replace(t); } catch (e) {}
+    // 若 250ms 后仍停在跳板页，说明自动被拦，提示用户点击
+    setTimeout(function () {
+      try {
+        if (location.hostname === 'tauri.localhost') {
+          var s = document.getElementById('status');
+          if (s) s.textContent = '自动跳转被拦截 — 请点击下方按钮进入 ↓';
+          try { window.location.href = t; } catch (e) {}
+        }
+      } catch (e) {}
+    }, 250);
+  }
+
+  function boot() {
+    var t = window.__DIAG_TARGET__;
+    if (!t) {
+      if (attempts++ < 150) { setTimeout(boot, 30); return; }
+      document.getElementById('status').textContent = '未获取到目标地址（__DIAG_TARGET__ 为空）';
+      return;
+    }
+    ready(t);
+  }
+
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', go);
+    document.addEventListener('DOMContentLoaded', boot);
   } else {
-    go();
+    boot();
   }
 })();
 </script>
-</head>
-<body style="background:#1a1a2e;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-family:sans-serif;font-size:16px;">
-  正在打开诊断浏览器...
 </body>
 </html>

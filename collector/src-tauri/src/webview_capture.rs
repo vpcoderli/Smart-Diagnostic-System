@@ -213,9 +213,9 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
 
     let parsed_url: url::Url = url.parse().map_err(|e| format!("URL 格式无效: {}", e))?;
 
-    const NAV_TAG: &str = "v8";
+    const NAV_TAG: &str = "v9";
     let friendly_title =
-        "🔍 诊断浏览器【v8】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
+        "🔍 诊断浏览器【v9】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
     let target_host = parsed_url.host_str().map(|s| s.to_string());
 
     // ── v8 核心方案：跳板页 + 页面自身脚本跳转 ──
