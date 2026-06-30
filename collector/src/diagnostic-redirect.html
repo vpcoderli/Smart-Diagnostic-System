@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>诊断浏览器</title>
+<script>
+// initialization_script 在此页加载前设置 window.__DIAG_TARGET__，
+// 本脚本作为普通页面脚本读取并执行跳转（与用户手动控制台等价，无 WebView2 限制）。
+(function () {
+  function go() {
+    var url = window.__DIAG_TARGET__;
+    if (url) {
+      window.location.replace(url);
+    } else {
+      // 极少数情况下 init script 还没跑完，稍后重试
+      setTimeout(go, 30);
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', go);
+  } else {
+    go();
+  }
+})();
+</script>
+</head>
+<body style="background:#1a1a2e;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-family:sans-serif;font-size:16px;">
+  正在打开诊断浏览器...
+</body>
+</html>

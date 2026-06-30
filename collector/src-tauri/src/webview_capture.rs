@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
@@ -205,59 +206,40 @@ const DIAGNOSTIC_JS: &str = r#"
 
 /// 打开诊断浏览器窗口
 pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> {
-    // 如果已存在诊断窗口，先关闭
     if let Some(existing) = app.get_webview_window("diagnostic") {
         let _ = existing.close();
-        // 短暂等待以确保旧窗口资源释放
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     let parsed_url: url::Url = url.parse().map_err(|e| format!("URL 格式无效: {}", e))?;
 
-    // 版本标记：用于在标题栏肉眼确认运行的是最新二进制（排除旧安装包干扰）。
-    const NAV_TAG: &str = "v7";
+    const NAV_TAG: &str = "v8";
     let friendly_title =
-        "🔍 诊断浏览器【v7】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
+        "🔍 诊断浏览器【v8】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
     let target_host = parsed_url.host_str().map(|s| s.to_string());
 
-    // ── 核心修复：自跳转注入脚本（延迟 + 轮询重试）──
-    // 实测结论：Windows 上 Rust→webview 的 navigate()/eval() 消息通道对该诊断窗口
-    // 失效（窗口始终停在 app 壳 tauri.localhost），但用户手动在控制台执行
-    // location.replace 成功 —— 即「页内导航」可靠，区别只在时机。
-    // 注入脚本经 AddScriptToExecuteOnDocumentCreated 在文档「刚创建」的极早期运行，
-    // 此时直接 location.replace 会被丢弃。故改为：发现自己在 app 壳就用 setInterval
-    // 反复尝试 location.replace，直到真正跳离 app 壳（或超过重试上限）。一旦到达目标
-    // 页，守卫为假，不再跳转，抓包脚本正常运行。整个过程在页面内完成，不经任何
-    // Rust→webview 通道。
-    let redirect_prelude = format!(
-        r#"(function(){{
-  var TARGET = {:?};
-  function onShell() {{
-    try {{
-      var h = location.hostname, p = location.protocol, u = location.href;
-      return (h === 'tauri.localhost' || p === 'tauri:' || u === 'about:blank' || u === '');
-    }} catch(e) {{ return true; }}
-  }}
-  if (!onShell()) return;            // 已在目标页：交给抓包脚本，不跳转
-  function go() {{ try {{ if (onShell()) location.replace(TARGET); }} catch(e) {{}} }}
-  var n = 0;
-  var timer = setInterval(function() {{
-    n++;
-    if (!onShell() || n > 50) {{ clearInterval(timer); return; }}
-    go();
-  }}, 150);
-  // 文档就绪后也各试一次，覆盖不同时机
-  try {{ document.addEventListener('DOMContentLoaded', go); }} catch(e) {{}}
-  try {{ window.addEventListener('load', go); }} catch(e) {{}}
-  setTimeout(go, 60);
-}})();
-"#,
-        parsed_url.as_str()
-    );
-    let init_script = format!("{}{}", redirect_prelude, DIAGNOSTIC_JS);
+    // ── v8 核心方案：跳板页 + 页面自身脚本跳转 ──
+    //
+    // v2-v7 全部失败的根因：
+    //   - WebView2 宿主级安全限制：AddScriptToExecuteOnDocumentCreated（init script）中
+    //     发起的跨源导航被静默拒绝，无论是 location.replace / setInterval 轮询均无效。
+    //   - Rust navigate() / eval() 消息通道对该窗口同样失效。
+    //
+    // 已知有效路径（用户手动控制台验证）：
+    //   在 tauri.localhost 页面的「普通页面脚本」中调用 location.replace() → 成功跳转。
+    //
+    // v8 方案：
+    //   1. 用 WebviewUrl::App 加载本地跳板页 diagnostic-redirect.html（非 External URL）
+    //   2. initialization_script 只做一件事：设置 window.__DIAG_TARGET__ = url（属性赋值，
+    //      不是导航，无任何限制）以及注入 DIAGNOSTIC_JS 抓包逻辑
+    //   3. 跳板页的 <script>（普通页面脚本，与用户控制台等价）读取 __DIAG_TARGET__ 并
+    //      调用 location.replace() → 成功跳转到医院页面
+    //   4. 医院页面加载时 initialization_script 再次运行，DIAGNOSTIC_JS 正常拦截 API
+    let set_target_js = format!("window.__DIAG_TARGET__ = {:?};", url);
+    let init_script = format!("{}\n{}", set_target_js, DIAGNOSTIC_JS);
 
     let _window =
-        WebviewWindowBuilder::new(app, "diagnostic", WebviewUrl::External(parsed_url.clone()))
+        WebviewWindowBuilder::new(app, "diagnostic", WebviewUrl::App(PathBuf::from("diagnostic-redirect.html")))
             .title(friendly_title)
             .inner_size(1280.0, 900.0)
             .center()
@@ -268,7 +250,6 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
                 true
             })
             .on_page_load(move |window, payload| {
-                // 仅作仪表：把真实加载地址写进标题栏，便于无 devtools 排查。
                 let loaded = payload.url().clone();
                 tracing::info!("诊断窗口 on_page_load [{:?}] -> {}", payload.event(), loaded);
                 let on_target = loaded.host_str().map(|s| s.to_string()) == target_host;
