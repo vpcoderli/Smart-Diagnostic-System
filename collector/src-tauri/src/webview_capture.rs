@@ -1,5 +1,4 @@
 use std::sync::Mutex;
-use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// 诊断窗口捕获的请求数据（通过 custom protocol 回传）
@@ -187,7 +186,20 @@ const DIAGNOSTIC_JS: &str = r#"
     window.__diag_page_url = location.href;
   });
 
-  console.log('[Smart-Diag] API 捕获脚本已注入（XHR + fetch，过滤静态资源）');
+  // ═══ 周期性自动回传 ═══
+  // 实测 Windows 上 Rust→webview 的 eval 通道可能失效，导致主窗口点「采集完成」
+  // 时 Rust 触发的 __sendDiagData() 送不达。这里让页面自身每 2s 主动把已采集数据
+  // POST 到 diag://collect，使采集不依赖 Rust eval。仅在有数据时发送，避免用空数据
+  // 覆盖已采集结果。
+  setInterval(function() {
+    try {
+      if (window.__diag_requests && window.__diag_requests.length > 0) {
+        window.__sendDiagData();
+      }
+    } catch(e) {}
+  }, 2000);
+
+  console.log('[Smart-Diag] API 捕获脚本已注入（XHR + fetch，过滤静态资源，含周期回传）');
 })();
 "#;
 
@@ -203,74 +215,53 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
     let parsed_url: url::Url = url.parse().map_err(|e| format!("URL 格式无效: {}", e))?;
 
     // 版本标记：用于在标题栏肉眼确认运行的是最新二进制（排除旧安装包干扰）。
-    const NAV_TAG: &str = "v5";
+    const NAV_TAG: &str = "v6";
     let friendly_title =
-        "🔍 诊断浏览器【v5】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
+        "🔍 诊断浏览器【v6】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
     let target_host = parsed_url.host_str().map(|s| s.to_string());
-    // 用 location.replace 触发的「页内导航」JS。注意：实测 Rust 侧 navigate()
-    // 对该窗口无效（窗口始终停在 app 自身 tauri.localhost）。location.replace 是
-    // 在已加载文档的 JS 上下文里发起的真正页内导航，WebView2 必然执行，是与
-    // navigate() 完全不同的通道。{:?} 把 URL 转成合法的 JS 字符串字面量。
-    let nav_js = format!("window.location.replace({:?})", parsed_url.as_str());
-    // 是否已到达目标页（由 on_page_load 用 payload 的真实地址置位，可靠，
-    // 不依赖在 Windows 上不稳的 webview.url()）。
-    let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let reached_cb = reached.clone();
-    let nav_js_cb = nav_js.clone();
+    // ── 核心修复：自跳转注入脚本 ──
+    // 实测结论：Windows 上 Rust→webview 的 navigate()/eval() 消息通道对该诊断窗口
+    // 失效 —— 窗口始终停在 app 自身地址 tauri.localhost。但用户手动在控制台执行
+    // location.replace 是成功的，即「页内导航」可靠。
+    // 这里把跳转逻辑写进 initialization_script —— 它经 WebView2 的
+    // AddScriptToExecuteOnDocumentCreated 在每个新文档自动执行，完全不经过那个失效
+    // 的 Rust→webview 通道。页面一旦发现自己停在 app 壳（tauri.localhost / tauri: /
+    // about:blank）就自行 location.replace 到目标地址。到达目标页后该守卫为假，不再
+    // 跳转，抓包脚本正常运行。
+    let redirect_prelude = format!(
+        "(function(){{try{{var h=location.hostname,p=location.protocol,u=location.href;\
+if(h==='tauri.localhost'||p==='tauri:'||u==='about:blank'||u===''){{location.replace({:?});}}}}\
+catch(e){{}}}})();\n",
+        parsed_url.as_str()
+    );
+    let init_script = format!("{}{}", redirect_prelude, DIAGNOSTIC_JS);
+
     let _window =
         WebviewWindowBuilder::new(app, "diagnostic", WebviewUrl::External(parsed_url.clone()))
             .title(friendly_title)
             .inner_size(1280.0, 900.0)
             .center()
-            .initialization_script(DIAGNOSTIC_JS)
+            .initialization_script(&init_script)
             .devtools(true)
             .on_navigation(|u| {
                 tracing::info!("诊断窗口 on_navigation -> {}", u);
                 true
             })
             .on_page_load(move |window, payload| {
+                // 仅作仪表：把真实加载地址写进标题栏，便于无 devtools 排查。
                 let loaded = payload.url().clone();
-                let event = payload.event();
-                tracing::info!("诊断窗口 on_page_load [{:?}] -> {}", event, loaded);
+                tracing::info!("诊断窗口 on_page_load [{:?}] -> {}", payload.event(), loaded);
                 let on_target = loaded.host_str().map(|s| s.to_string()) == target_host;
                 if on_target {
-                    // 已到目标页：置位、恢复友好标题
-                    reached_cb.store(true, std::sync::atomic::Ordering::SeqCst);
                     let _ = window.set_title(friendly_title);
                 } else {
-                    // 仍停在 app/空白页：标题暴露真实地址；文档加载完成后在页面
-                    // 上下文里用 location.replace 跳到目标（比 navigate() 可靠）。
                     let _ = window
                         .set_title(&format!("诊断浏览器【{}】[加载: {}]", NAV_TAG, loaded));
-                    if matches!(event, PageLoadEvent::Finished) {
-                        tracing::warn!("诊断窗口停在 {}，eval location.replace 跳转目标", loaded);
-                        let _ = window.eval(&nav_js_cb);
-                    }
                 }
             })
             .build()
             .map_err(|e| format!("创建诊断窗口失败: {}", e))?;
-
-    // 重试式兜底（eval 通道）：
-    // 即便 on_page_load 因外部首跳被静默取消而从未对 app 页触发，这个线程也会
-    // 周期性地在当前文档里 eval location.replace 把它推向目标。每 1.2s 一次，
-    // 一旦 on_page_load 观察到已落在目标 host（reached 置位）即停止，避免对已
-    // 到达目标页的窗口反复刷新。总窗口约 12s，覆盖虚拟机 WebView2 冷启动。
-    {
-        let wnd = _window.clone();
-        let nav_js_th = nav_js.clone();
-        let reached_th = reached.clone();
-        std::thread::spawn(move || {
-            for _ in 1..=10u32 {
-                std::thread::sleep(std::time::Duration::from_millis(1200));
-                if reached_th.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-                let _ = wnd.eval(&nav_js_th);
-            }
-        });
-    }
 
     tracing::info!("诊断浏览器已打开: {}", url);
     Ok(())
