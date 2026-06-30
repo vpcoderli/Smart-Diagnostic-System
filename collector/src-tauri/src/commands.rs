@@ -695,13 +695,13 @@ pub fn reset_capture_data(
             })();
         "#,
         );
-        // 如果提供了目标 URL，重新导航以捕获页面初始加载的 API 请求
+        // 如果提供了目标 URL，重新导航到目标页；实际采集只记录后续用户主动操作触发的接口。
         if let Some(ref url) = target_url {
             if !url.is_empty() {
                 let nav_js = format!("window.location.href = '{}';", url.replace('\'', "\\'"));
                 let _ = window.eval(&nav_js);
                 tracing::info!("重置采集并重新导航到: {}", url);
-                return "已重置并重新加载目标页面，请等待页面加载完成后操作".to_string();
+                return "已重置采集，请在诊断浏览器内点击或操作目标功能".to_string();
             }
         }
     }

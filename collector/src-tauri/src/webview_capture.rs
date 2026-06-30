@@ -136,16 +136,53 @@ const DIAGNOSTIC_JS: &str = r#"
   var _dataEventName = 'smart-diag-capture-data';
   var _origTitle = document.title || '';
   var _lastReportedCount = null;
+  var _USER_ACTION_WINDOW_MS = 15000;
+  var _CAPTURE_SESSION_TTL_MS = 30 * 60 * 1000;
+  var _captureStorageKey = 'smart-diag-capture-session';
 
   function _newSessionId() {
     return 'session-' + Date.now() + '-' + Math.random().toString(36).slice(2);
   }
 
-  window.__diag_capture_session_id = window.__diag_capture_session_id || _newSessionId();
-  window.__diag_capture_started_at = window.__diag_capture_started_at || Date.now();
+  function _readStoredCaptureSession() {
+    try {
+      var raw = sessionStorage.getItem(_captureStorageKey);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (!parsed || parsed.armed !== true) return null;
+      if (!parsed.sessionStartedAt || (Date.now() - parsed.sessionStartedAt) > _CAPTURE_SESSION_TTL_MS) {
+        sessionStorage.removeItem(_captureStorageKey);
+        return null;
+      }
+      return parsed;
+    } catch(e) {
+      return null;
+    }
+  }
+
+  function _persistCaptureSession() {
+    try {
+      sessionStorage.setItem(_captureStorageKey, JSON.stringify({
+        armed: window.__diag_capture_armed === true,
+        sessionId: window.__diag_capture_session_id,
+        sessionStartedAt: window.__diag_capture_started_at
+      }));
+    } catch(e) {}
+  }
+
+  var _storedSession = _readStoredCaptureSession();
+  window.__diag_capture_session_id = window.__diag_capture_session_id || (_storedSession && _storedSession.sessionId) || _newSessionId();
+  window.__diag_capture_started_at = window.__diag_capture_started_at || (_storedSession && _storedSession.sessionStartedAt) || Date.now();
   window.__diag_capture_started_perf = window.__diag_capture_started_perf == null
     ? performance.now()
     : window.__diag_capture_started_perf;
+  if (window.__diag_capture_armed !== true) {
+    window.__diag_capture_armed = false;
+    if (_storedSession && _storedSession.armed === true) {
+      window.__diag_capture_armed = !!(_storedSession && _storedSession.armed === true);
+    }
+  }
+  window.__diag_last_user_action_at = window.__diag_last_user_action_at || 0;
 
   // ═══ 静态资源过滤 ═══
   var _staticExts = /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i;
@@ -159,6 +196,20 @@ const DIAGNOSTIC_JS: &str = r#"
     if (!url || url.indexOf('diag://') === 0) return false;
     if (_isStaticResource(url)) return false;
     return true;
+  }
+
+  function _markUserAction() {
+    if (!window.__diag_capture_armed) return;
+    window.__diag_last_user_action_at = Date.now();
+  }
+
+  function _shouldRecordRequest(startedAtMs) {
+    if (!window.__diag_capture_armed) return false;
+    var actionAt = window.__diag_last_user_action_at || 0;
+    if (!actionAt) return false;
+    var startedAt = startedAtMs || Date.now();
+    if (startedAt < actionAt) return false;
+    return (startedAt - actionAt) <= _USER_ACTION_WINDOW_MS;
   }
 
   function _requestKey(req) {
@@ -211,6 +262,7 @@ const DIAGNOSTIC_JS: &str = r#"
 
   function _performanceRequests(skipUrls) {
     var requests = [];
+    if (!window.__diag_capture_armed) return requests;
     try {
       var entries = performance.getEntriesByType('resource') || [];
       entries.forEach(function(entry) {
@@ -224,6 +276,7 @@ const DIAGNOSTIC_JS: &str = r#"
           startedAt = Math.round(performance.timeOrigin + entry.startTime);
         }
         if (startedAt < window.__diag_capture_started_at) return;
+        if (!_shouldRecordRequest(startedAt)) return;
         requests.push({
           method: 'GET',
           url: entry.name,
@@ -242,6 +295,7 @@ const DIAGNOSTIC_JS: &str = r#"
   }
 
   function _localRequestsWithPerformance() {
+    if (!window.__diag_capture_armed) return [];
     var seen = {};
     var skipUrls = {};
     var all = [];
@@ -272,6 +326,7 @@ const DIAGNOSTIC_JS: &str = r#"
 
   function _mergeFramePayload(payload) {
     if (!_isTop || !payload) return;
+    if (!window.__diag_capture_armed) return;
     if (payload.sessionStartedAt && payload.sessionStartedAt < window.__diag_capture_started_at) return;
     if (
       payload.sessionId &&
@@ -287,6 +342,7 @@ const DIAGNOSTIC_JS: &str = r#"
   }
 
   function _allRequests() {
+    if (!window.__diag_capture_armed) return [];
     if (!_isTop) return _localRequestsWithPerformance();
     _ensureTopStores();
     _mergeFramePayload({
@@ -328,6 +384,10 @@ const DIAGNOSTIC_JS: &str = r#"
   }
 
   function _publishCaptureState() {
+    if (!window.__diag_capture_armed) {
+      if (_isTop) _setTopCountTitle(0);
+      return;
+    }
     var payload = {
       type: _frameMessageType,
       frameId: _frameId,
@@ -353,6 +413,9 @@ const DIAGNOSTIC_JS: &str = r#"
     window.__diag_capture_session_id = session.sessionId || _newSessionId();
     window.__diag_capture_started_at = session.sessionStartedAt || Date.now();
     window.__diag_capture_started_perf = performance.now();
+    window.__diag_capture_armed = true;
+    window.__diag_last_user_action_at = 0;
+    _persistCaptureSession();
     _lastReportedCount = null;
     window.__diag_requests = [];
     window.__diag_page_url = location.href;
@@ -414,15 +477,23 @@ const DIAGNOSTIC_JS: &str = r#"
     });
   } catch(e) {}
 
+  try {
+    ['pointerdown', 'click', 'dblclick', 'keydown', 'change', 'submit'].forEach(function(name) {
+      window.addEventListener(name, _markUserAction, true);
+    });
+  } catch(e) {}
+
   // ═══ 拦截 fetch ═══
   window.fetch = async function(input, init) {
     const start = performance.now();
+    const requestStartedAtMs = Date.now();
+    var shouldRecordRequest = _shouldRecordRequest(requestStartedAtMs);
     let url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
     let method = (init && init.method) || (input instanceof Request ? input.method : 'GET');
 
     try {
       const resp = await _origFetch.call(window, input, init);
-      if (_shouldCapture(url)) {
+      if (shouldRecordRequest && _shouldCapture(url)) {
         const duration = Math.round(performance.now() - start);
         let size = null;
         const cl = resp.headers.get('content-length');
@@ -434,17 +505,17 @@ const DIAGNOSTIC_JS: &str = r#"
           status: resp.status,
           durationMs: duration,
           traceId: resp.headers.get('x-trace') || resp.headers.get('x-trace-id') || resp.headers.get('traceparent') || null,
-          timestamp: new Date().toISOString(),
+          timestamp: new Date(requestStartedAtMs).toISOString(),
           requestType: 'fetch',
           responseSize: size,
-          capturedAtMs: Date.now(),
+          capturedAtMs: requestStartedAtMs,
           __diag_session_id: window.__diag_capture_session_id
         });
         _notifyCount();
       }
       return resp;
     } catch (err) {
-      if (_shouldCapture(url)) {
+      if (shouldRecordRequest && _shouldCapture(url)) {
         const duration = Math.round(performance.now() - start);
         window.__diag_requests.push({
           method: method.toUpperCase(),
@@ -452,10 +523,10 @@ const DIAGNOSTIC_JS: &str = r#"
           status: 0,
           durationMs: duration,
           traceId: null,
-          timestamp: new Date().toISOString(),
+          timestamp: new Date(requestStartedAtMs).toISOString(),
           requestType: 'fetch',
           responseSize: null,
-          capturedAtMs: Date.now(),
+          capturedAtMs: requestStartedAtMs,
           __diag_session_id: window.__diag_capture_session_id
         });
         _notifyCount();
@@ -476,8 +547,11 @@ const DIAGNOSTIC_JS: &str = r#"
   XMLHttpRequest.prototype.send = function() {
     if (this.__diag) {
       this.__diag.start = performance.now();
+      this.__diag.requestStartedAtMs = Date.now();
+      this.__diag.shouldRecordRequest = _shouldRecordRequest(this.__diag.requestStartedAtMs);
       this.addEventListener('loadend', function() {
         var url = this.__diag.url;
+        if (!this.__diag.shouldRecordRequest) return;
         if (!_shouldCapture(url)) return;
 
         var duration = Math.round(performance.now() - this.__diag.start);
@@ -499,10 +573,10 @@ const DIAGNOSTIC_JS: &str = r#"
           status: this.status,
           durationMs: duration,
           traceId: traceId,
-          timestamp: new Date().toISOString(),
+          timestamp: new Date(this.__diag.requestStartedAtMs).toISOString(),
           requestType: 'xhr',
           responseSize: size,
-          capturedAtMs: Date.now(),
+          capturedAtMs: this.__diag.requestStartedAtMs,
           __diag_session_id: window.__diag_capture_session_id
         });
         _notifyCount();
@@ -513,6 +587,12 @@ const DIAGNOSTIC_JS: &str = r#"
 
   // ═══ 获取采集数据 ═══
   window.__getDiagData = function() {
+    if (!window.__diag_capture_armed) {
+      return JSON.stringify({
+        pageUrl: window.__diag_page_url || location.href,
+        requests: []
+      });
+    }
     return JSON.stringify({
       pageUrl: window.__diag_page_url || location.href,
       requests: _isTop ? _allRequests() : _localRequestsWithPerformance()
@@ -520,6 +600,7 @@ const DIAGNOSTIC_JS: &str = r#"
   };
 
   window.__getDiagCount = function() {
+    if (!window.__diag_capture_armed) return 0;
     return (_isTop ? _allRequests() : _localRequestsWithPerformance()).length;
   };
 
@@ -805,6 +886,58 @@ mod tests {
             super::FORCE_DIAGNOSTIC_SNAPSHOT_JS.contains("window.__getDiagData"),
             "强制快照应复用注入脚本聚合后的 frame 数据，不能用顶层空快照覆盖完整数据"
         );
+    }
+
+    #[test]
+    fn diagnostic_script_starts_disarmed_until_user_resets_capture() {
+        assert!(super::DIAGNOSTIC_JS.contains("window.__diag_capture_armed = false"));
+        assert!(super::DIAGNOSTIC_JS.contains("window.__diag_capture_armed = true"));
+        assert!(
+            super::DIAGNOSTIC_JS.contains("if (!window.__diag_capture_armed) return 0"),
+            "诊断浏览器刚打开、登录前不能累计系统初始化或轮询请求"
+        );
+        assert!(
+            super::DIAGNOSTIC_JS.contains("if (!window.__diag_capture_armed) return []"),
+            "未点击重置采集前，强制快照也必须返回空请求"
+        );
+    }
+
+    #[test]
+    fn diagnostic_script_records_only_requests_triggered_by_user_actions() {
+        assert!(super::DIAGNOSTIC_JS.contains("_USER_ACTION_WINDOW_MS"));
+        assert!(super::DIAGNOSTIC_JS.contains("__diag_last_user_action_at"));
+        assert!(super::DIAGNOSTIC_JS.contains("function _markUserAction()"));
+        assert!(
+            super::DIAGNOSTIC_JS.contains("window.addEventListener(name, _markUserAction, true)")
+        );
+        assert!(super::DIAGNOSTIC_JS.contains("function _shouldRecordRequest(startedAtMs)"));
+        assert!(
+            super::DIAGNOSTIC_JS
+                .contains("var shouldRecordRequest = _shouldRecordRequest(requestStartedAtMs)"),
+            "fetch 必须按请求开始时间判断是否由用户操作触发"
+        );
+        assert!(
+            super::DIAGNOSTIC_JS.contains("this.__diag.shouldRecordRequest"),
+            "XHR 必须按 send 时刻判断是否由用户操作触发"
+        );
+        assert!(
+            super::DIAGNOSTIC_JS.contains("_shouldRecordRequest(startedAt)"),
+            "performance fallback 不能把后台轮询重新捞回快照"
+        );
+    }
+
+    #[test]
+    fn diagnostic_script_keeps_reset_capture_armed_across_navigation() {
+        assert!(super::DIAGNOSTIC_JS.contains("_captureStorageKey"));
+        assert!(super::DIAGNOSTIC_JS.contains("function _readStoredCaptureSession()"));
+        assert!(
+            super::DIAGNOSTIC_JS.contains("var _storedSession = _readStoredCaptureSession()")
+        );
+        assert!(
+            super::DIAGNOSTIC_JS
+                .contains("window.__diag_capture_armed = !!(_storedSession")
+        );
+        assert!(super::DIAGNOSTIC_JS.contains("sessionStorage.setItem(_captureStorageKey"));
     }
 
     #[test]
