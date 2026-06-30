@@ -33,6 +33,42 @@ pub fn source_supports_mode(source: &str, mode: &str) -> bool {
     }
 }
 
+const DIAG_DATA_START_MARKER: &str = "__DIAG_DATA_START__";
+const DIAG_DATA_END_MARKER: &str = "__DIAG_DATA_END__";
+
+fn extract_diag_data_from_title(title: &str) -> Option<String> {
+    let start = title.find(DIAG_DATA_START_MARKER)?;
+    let data_start = start + DIAG_DATA_START_MARKER.len();
+    let rest = &title[data_start..];
+    let end = rest.find(DIAG_DATA_END_MARKER)?;
+    if end == 0 {
+        None
+    } else {
+        Some(rest[..end].to_string())
+    }
+}
+
+fn extract_diag_count_from_title(title: &str) -> Option<usize> {
+    let start = title.find("[DIAG:")?;
+    let rest = &title[start + 6..];
+    let end = rest.find(']')?;
+    rest[..end].parse::<usize>().ok()
+}
+
+fn read_collected_diag_data(
+    captured_store: &Arc<crate::webview_capture::CapturedDataStore>,
+    window: &tauri::WebviewWindow,
+) -> Option<String> {
+    if let Some(json) = captured_store.data.lock().unwrap().clone() {
+        return Some(json);
+    }
+
+    window
+        .title()
+        .ok()
+        .and_then(|title| extract_diag_data_from_title(&title))
+}
+
 // ═══════════════════════════════════════
 // 第一步：部署文档导入
 // ═══════════════════════════════════════
@@ -459,16 +495,18 @@ pub async fn open_diag_browser(
     url: String,
     app: tauri::AppHandle,
     captured_store: State<'_, std::sync::Arc<crate::webview_capture::CapturedDataStore>>,
+    count: State<'_, std::sync::Arc<std::sync::Mutex<usize>>>,
 ) -> Result<String, String> {
     // 清除上一次的捕获数据
     *captured_store.data.lock().unwrap() = None;
+    *count.lock().unwrap() = 0;
 
     crate::webview_capture::open_diagnostic_window(&app, &url)?;
     Ok(format!("诊断浏览器已打开: {}", url))
 }
 
 /// 从诊断浏览器收集捕获的请求数据
-/// 多重备选机制确保数据回传：XHR → fetch → iframe navigation
+/// 外部医院页面在 Windows WebView2 中不能用 XHR/fetch 访问 diag://，因此优先读取标题中转数据。
 #[tauri::command]
 pub async fn collect_diag_data(
     app: tauri::AppHandle,
@@ -479,25 +517,24 @@ pub async fn collect_diag_data(
     // 清除旧数据
     *captured_store.data.lock().unwrap() = None;
 
-    // 触发诊断窗口发送数据（通过 custom protocol）
+    let window = app
+        .get_webview_window("diagnostic")
+        .ok_or("诊断窗口未打开")?;
+
+    // 触发诊断窗口发送数据（Windows 外部页通过标题中转，旧路径仍可写入 captured_store）
     crate::webview_capture::trigger_data_collection(&app)?;
 
     // 等待数据到达（最多等 3 秒）
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let data = captured_store.data.lock().unwrap();
-        if data.is_some() {
-            let json = data.clone().unwrap();
+        if let Some(json) = read_collected_diag_data(captured_store.inner(), &window) {
             tracing::info!("已收集诊断数据: {} bytes", json.len());
             return Ok(json);
         }
     }
 
     // Fallback 1: 再次触发
-    tracing::warn!("首次 custom protocol 超时，重试...");
-    let window = app
-        .get_webview_window("diagnostic")
-        .ok_or("诊断窗口未打开")?;
+    tracing::warn!("首次标题中转超时，重试触发诊断数据回传...");
 
     let _ = window.eval(
         "try { window.__sendDiagData(); } catch(e) { console.error('sendDiagData failed:', e); }",
@@ -505,113 +542,53 @@ pub async fn collect_diag_data(
 
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let data = captured_store.data.lock().unwrap();
-        if data.is_some() {
-            let json = data.clone().unwrap();
+        if let Some(json) = read_collected_diag_data(captured_store.inner(), &window) {
             tracing::info!("已收集诊断数据(重试): {} bytes", json.len());
             return Ok(json);
         }
     }
 
-    // Fallback 2: 通过 iframe src 导航触发 custom protocol（某些 WKWebView 版本只允许导航式请求）
-    tracing::warn!("XHR/fetch 均超时，尝试 iframe 导航方式...");
+    // Fallback 2: 直接写标题，避开 custom scheme 的 CORS/协议限制。
+    tracing::warn!("诊断脚本回传超时，尝试直接 title 中转...");
     let _ = window.eval(r#"
         (function() {
             try {
-                var data = window.__getDiagData();
-                var form = document.createElement('form');
-                form.method = 'POST';
-                form.action = 'diag://collect';
-                form.target = '_diag_frame';
-                form.style.display = 'none';
-                var input = document.createElement('input');
-                input.type = 'hidden';
-                input.name = 'data';
-                input.value = data;
-                form.appendChild(input);
-                var iframe = document.getElementById('_diag_frame') || document.createElement('iframe');
-                iframe.id = '_diag_frame';
-                iframe.name = '_diag_frame';
-                iframe.style.display = 'none';
-                document.body.appendChild(iframe);
-                document.body.appendChild(form);
-                form.submit();
-                setTimeout(function(){ form.remove(); }, 500);
-            } catch(e) { console.error('[Smart-Diag] iframe fallback failed:', e); }
+                var data = window.__getDiagData
+                    ? window.__getDiagData()
+                    : JSON.stringify({ pageUrl: location.href, requests: window.__diag_requests || [] });
+                document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
+            } catch(e) { console.error('[Smart-Diag] title fallback failed:', e); }
         })();
     "#);
 
-    for _ in 0..30 {
+    for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let data = captured_store.data.lock().unwrap();
-        if data.is_some() {
-            let json = data.clone().unwrap();
-            tracing::info!("已收集诊断数据(iframe): {} bytes", json.len());
+        if let Some(json) = read_collected_diag_data(captured_store.inner(), &window) {
+            tracing::info!("已收集诊断数据(title中转): {} bytes", json.len());
             return Ok(json);
         }
     }
 
-    // Fallback 3: 如果所有 protocol 方式都失败，直接通过 eval 获取数据存入标题
-    // 这是最后手段——数据量大时标题会被截断，但至少能获得部分数据
-    tracing::warn!("所有 protocol 方式均失败，尝试 title 中转...");
-    let _ = window.eval(
-        r#"
-        (function() {
-            try {
-                var data = window.__getDiagData();
-                document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
-            } catch(e) {}
-        })();
-    "#,
-    );
-
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    if let Ok(title) = window.title() {
-        if let Some(start) = title.find("__DIAG_DATA_START__") {
-            let data_start = start + "__DIAG_DATA_START__".len();
-            if let Some(end) = title.find("__DIAG_DATA_END__") {
-                let json = title[data_start..end].to_string();
-                if !json.is_empty() {
-                    tracing::info!("已收集诊断数据(title中转): {} bytes", json.len());
-                    return Ok(json);
-                }
-            }
-        }
-    }
-
-    Err("采集数据超时。diag:// 协议在当前环境不可用，请确认诊断浏览器窗口仍在运行。".to_string())
+    Err("采集数据超时。请确认诊断浏览器窗口仍在运行，目标页面加载完成后再点击收集。".to_string())
 }
 
 /// 获取当前捕获的请求计数（实时轮询用）
-/// 优先读 Rust 侧计数器（由 diag://count 更新），若为 0 则从诊断窗口标题解析计数
+/// Windows 外部页通过标题回传计数；旧 custom protocol 计数器作为兜底。
 #[tauri::command]
 pub async fn get_capture_count(
     count: State<'_, std::sync::Arc<std::sync::Mutex<usize>>>,
     app: tauri::AppHandle,
 ) -> Result<usize, String> {
     use tauri::Manager;
-    let rust_count = *count.lock().unwrap();
-    if rust_count > 0 {
-        return Ok(rust_count);
-    }
-    // Fallback: 从诊断窗口标题读取计数（JS 在标题中嵌入 [DIAG:N]）
     if let Some(window) = app.get_webview_window("diagnostic") {
         if let Ok(title) = window.title() {
-            if let Some(start) = title.find("[DIAG:") {
-                let rest = &title[start + 6..];
-                if let Some(end) = rest.find(']') {
-                    if let Ok(n) = rest[..end].parse::<usize>() {
-                        if n > 0 {
-                            *count.lock().unwrap() = n;
-                            return Ok(n);
-                        }
-                    }
-                }
+            if let Some(n) = extract_diag_count_from_title(&title) {
+                *count.lock().unwrap() = n;
+                return Ok(n);
             }
         }
     }
-    Ok(0)
+    Ok(*count.lock().unwrap())
 }
 
 /// 重置采集数据（登录完成后调用，清除登录期间的请求，从头开始捕获业务请求）
@@ -629,7 +606,25 @@ pub fn reset_capture_data(
     *count.lock().unwrap() = 0;
     // 在诊断 WebView 中清空并（可选）重新导航到目标页面
     if let Some(window) = app.get_webview_window("diagnostic") {
-        let _ = window.eval("window.__diag_requests = []; window.__diag_page_url = location.href;");
+        let _ = window.eval(r#"
+            (function() {
+                try {
+                    if (window.__resetDiagCapture) {
+                        window.__resetDiagCapture();
+                    } else {
+                        window.__diag_requests = [];
+                        window.__diag_frame_requests = {};
+                        window.__diag_frame_pages = {};
+                        window.__diag_page_url = location.href;
+                        if (document && document.title) {
+                            document.title = document.title
+                                .replace(/__DIAG_DATA_START__[\s\S]*?__DIAG_DATA_END__/g, '')
+                                .replace(/^\[DIAG:\d+\]\s*/, '');
+                        }
+                    }
+                } catch(e) {}
+            })();
+        "#);
         // 如果提供了目标 URL，重新导航以捕获页面初始加载的 API 请求
         if let Some(ref url) = target_url {
             if !url.is_empty() {
@@ -2423,7 +2418,7 @@ pub fn open_output_dir(path: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::source_supports_mode;
+    use super::{extract_diag_count_from_title, extract_diag_data_from_title, source_supports_mode};
 
     #[test]
     fn realtime_supports_all_three_sources() {
@@ -2459,5 +2454,34 @@ mod tests {
         assert!(!source_supports_mode("kafka", "realtime"));
         assert!(!source_supports_mode("elk", "teleport"));
         assert!(!source_supports_mode("", ""));
+    }
+
+    #[test]
+    fn extract_diag_data_from_title_reads_marker_payload() {
+        let payload = r#"{"pageUrl":"http://host/app","requests":[{"url":"/api/patient"}]}"#;
+        let title = format!("__DIAG_DATA_START__{}__DIAG_DATA_END__", payload);
+
+        assert_eq!(extract_diag_data_from_title(&title), Some(payload.to_string()));
+    }
+
+    #[test]
+    fn extract_diag_data_from_title_ignores_missing_or_empty_payload() {
+        assert_eq!(extract_diag_data_from_title("[DIAG:3] 页面"), None);
+        assert_eq!(
+            extract_diag_data_from_title("__DIAG_DATA_START____DIAG_DATA_END__"),
+            None
+        );
+        assert_eq!(
+            extract_diag_data_from_title("__DIAG_DATA_START__{}"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_diag_count_from_title_reads_latest_count() {
+        assert_eq!(extract_diag_count_from_title("[DIAG:12] 患者管理"), Some(12));
+        assert_eq!(extract_diag_count_from_title("诊断浏览器 [DIAG:0]"), Some(0));
+        assert_eq!(extract_diag_count_from_title("诊断浏览器"), None);
+        assert_eq!(extract_diag_count_from_title("[DIAG:abc] 页面"), None);
     }
 }

@@ -3,7 +3,7 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 static REDIRECT_TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-/// 诊断窗口捕获的请求数据（通过 custom protocol 回传）
+/// 诊断窗口捕获的请求数据（旧 custom protocol 路径会写入这里，Windows 外部页主要走标题中转）
 #[derive(Default)]
 pub struct CapturedDataStore {
     pub data: Mutex<Option<String>>,
@@ -14,11 +14,24 @@ const DIAGNOSTIC_JS: &str = r#"
 (function() {
   'use strict';
 
+  if (window.__SMART_DIAG_CAPTURE_INSTALLED__) {
+    console.log('[Smart-Diag] API 捕获脚本已存在，跳过重复注入');
+    return;
+  }
+  window.__SMART_DIAG_CAPTURE_INSTALLED__ = true;
+
   const _origXHR = XMLHttpRequest;
   const _origFetch = window.fetch;
 
-  window.__diag_requests = [];
+  window.__diag_requests = window.__diag_requests || [];
   window.__diag_page_url = location.href;
+  var _isTop = false;
+  try { _isTop = window === window.top; } catch(e) { _isTop = false; }
+  var _frameId = 'frame-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+  var _frameMessageType = 'smart-diag-frame-requests';
+  var _dataMessageType = 'smart-diag-data-ready';
+  var _resetMessageType = 'smart-diag-reset';
+  var _origTitle = document.title || '';
 
   // ═══ 静态资源过滤 ═══
   var _staticExts = /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i;
@@ -33,6 +46,136 @@ const DIAGNOSTIC_JS: &str = r#"
     if (_isStaticResource(url)) return false;
     return true;
   }
+
+  function _requestKey(req) {
+    return [
+      req.method || '',
+      req.url || '',
+      req.status == null ? '' : String(req.status),
+      req.timestamp || '',
+      req.requestType || ''
+    ].join('|');
+  }
+
+  function _ensureTopStores() {
+    if (!_isTop) return;
+    window.__diag_frame_requests = window.__diag_frame_requests || {};
+    window.__diag_frame_pages = window.__diag_frame_pages || {};
+  }
+
+  function _mergeFramePayload(payload) {
+    if (!_isTop || !payload) return;
+    _ensureTopStores();
+    var frameId = payload.frameId || 'unknown';
+    window.__diag_frame_requests[frameId] = Array.isArray(payload.requests) ? payload.requests : [];
+    if (payload.pageUrl) {
+      window.__diag_frame_pages[frameId] = payload.pageUrl;
+    }
+  }
+
+  function _allRequests() {
+    if (!_isTop) return window.__diag_requests || [];
+    _ensureTopStores();
+    _mergeFramePayload({
+      frameId: _frameId,
+      pageUrl: window.__diag_page_url || location.href,
+      requests: window.__diag_requests || []
+    });
+
+    var seen = {};
+    var all = [];
+    Object.keys(window.__diag_frame_requests).forEach(function(frameId) {
+      (window.__diag_frame_requests[frameId] || []).forEach(function(req) {
+        var key = _requestKey(req);
+        if (!seen[key]) {
+          seen[key] = true;
+          all.push(req);
+        }
+      });
+    });
+    return all;
+  }
+
+  function _setTopCountTitle(count) {
+    if (!_isTop) return;
+    try {
+      var base = (_origTitle || document.title || '').replace(/^\[DIAG:\d+\]\s*/, '');
+      document.title = '[DIAG:' + count + '] ' + base;
+    } catch(e) {}
+  }
+
+  function _publishCaptureState() {
+    var payload = {
+      type: _frameMessageType,
+      frameId: _frameId,
+      pageUrl: window.__diag_page_url || location.href,
+      requests: window.__diag_requests || []
+    };
+
+    if (_isTop) {
+      _mergeFramePayload(payload);
+      _setTopCountTitle(_allRequests().length);
+      return;
+    }
+
+    try {
+      window.top.postMessage(payload, '*');
+    } catch(e) {}
+  }
+
+  function _resetLocalCapture() {
+    window.__diag_requests = [];
+    window.__diag_page_url = location.href;
+    if (_isTop) {
+      window.__diag_frame_requests = {};
+      window.__diag_frame_pages = {};
+      _setTopCountTitle(0);
+    }
+  }
+
+  function _broadcastReset() {
+    if (!_isTop) return;
+    for (var i = 0; i < window.frames.length; i++) {
+      try {
+        window.frames[i].postMessage({ type: _resetMessageType }, '*');
+      } catch(e) {}
+    }
+  }
+
+  window.__resetDiagCapture = function() {
+    _resetLocalCapture();
+    if (_isTop) {
+      _broadcastReset();
+    } else {
+      _publishCaptureState();
+    }
+  };
+
+  try {
+    window.addEventListener('message', function(event) {
+      var data = event && event.data;
+      if (!data || typeof data !== 'object') return;
+      if (data.type === _resetMessageType) {
+        window.__resetDiagCapture();
+        return;
+      }
+      if (!_isTop) return;
+      if (data.type === _frameMessageType) {
+        _mergeFramePayload(data);
+        _setTopCountTitle(_allRequests().length);
+      } else if (data.type === _dataMessageType && data.data) {
+        try {
+          var parsed = JSON.parse(data.data);
+          _mergeFramePayload({
+            frameId: data.frameId,
+            pageUrl: parsed.pageUrl,
+            requests: parsed.requests
+          });
+        } catch(e) {}
+        window.__sendDiagData();
+      }
+    });
+  } catch(e) {}
 
   // ═══ 拦截 fetch ═══
   window.fetch = async function(input, init) {
@@ -129,79 +272,67 @@ const DIAGNOSTIC_JS: &str = r#"
   window.__getDiagData = function() {
     return JSON.stringify({
       pageUrl: window.__diag_page_url || location.href,
-      requests: window.__diag_requests || []
+      requests: _isTop ? _allRequests() : (window.__diag_requests || [])
     });
   };
 
   // ═══ 发送采集数据到 Rust 后端 ═══
   window.__sendDiagData = function() {
     var data = window.__getDiagData();
-    // 方式1: XHR POST（某些平台可能被阻止）
     try {
-      var xhr = new _origXHR();
-      xhr.open('POST', 'diag://collect', true);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.send(data);
-    } catch(e) {
-      console.warn('[Smart-Diag] XHR to diag://collect failed:', e);
-    }
-    // 方式2: fetch（作为备选）
-    try {
-      _origFetch.call(window, 'diag://collect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: data,
-        mode: 'no-cors'
-      }).catch(function(){});
+      if (_isTop) {
+        document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
+      } else {
+        window.top.postMessage({
+          type: _dataMessageType,
+          frameId: _frameId,
+          data: data
+        }, '*');
+      }
     } catch(e) {}
   };
 
   // ═══ 通知计数更新 ═══
-  var _origTitle = document.title;
   function _notifyCount() {
-    var count = window.__diag_requests.length;
-    // 主通道: XHR 到 custom protocol
-    try {
-      var xhr = new _origXHR();
-      xhr.open('POST', 'diag://count', true);
-      xhr.setRequestHeader('Content-Type', 'text/plain');
-      xhr.send(String(count));
-    } catch(e) {}
-    // 备用通道: 在标题中嵌入计数，供 Rust 侧直接读取
-    try {
-      document.title = '[DIAG:' + count + '] ' + (_origTitle || '');
-    } catch(e) {}
+    _publishCaptureState();
   }
 
   // ═══ 页面导航时更新 URL ═══
   var _pushState = history.pushState;
   var _replaceState = history.replaceState;
   history.pushState = function() {
-    _pushState.apply(this, arguments);
+    var ret = _pushState.apply(this, arguments);
     window.__diag_page_url = location.href;
+    _publishCaptureState();
+    return ret;
   };
   history.replaceState = function() {
-    _replaceState.apply(this, arguments);
+    var ret = _replaceState.apply(this, arguments);
     window.__diag_page_url = location.href;
+    _publishCaptureState();
+    return ret;
   };
   window.addEventListener('popstate', function() {
     window.__diag_page_url = location.href;
+    _publishCaptureState();
   });
 
-  // ═══ 周期性自动回传 ═══
-  // 实测 Windows 上 Rust→webview 的 eval 通道可能失效，导致主窗口点「采集完成」
-  // 时 Rust 触发的 __sendDiagData() 送不达。这里让页面自身每 2s 主动把已采集数据
-  // POST 到 diag://collect，使采集不依赖 Rust eval。仅在有数据时发送，避免用空数据
-  // 覆盖已采集结果。
+  // ═══ 周期性刷新顶层计数 ═══
+  // 外部医院页面不能通过 XHR/fetch 访问 diag:// 自定义协议；WebView2 会按 CORS
+  // 拦截。因此 frame 内捕获的数据通过 postMessage 汇总到顶层页，顶层页再把计数
+  // 写进标题栏，供 Rust 侧轮询读取。
   setInterval(function() {
     try {
-      if (window.__diag_requests && window.__diag_requests.length > 0) {
-        window.__sendDiagData();
+      if (_isTop) {
+        var count = _allRequests().length;
+        if (count > 0) _setTopCountTitle(count);
+      } else if (window.__diag_requests && window.__diag_requests.length > 0) {
+        _publishCaptureState();
       }
     } catch(e) {}
-  }, 2000);
+  }, 1000);
 
-  console.log('[Smart-Diag] API 捕获脚本已注入（XHR + fetch，过滤静态资源，含周期回传）');
+  console.log('[Smart-Diag] API 捕获脚本已注入（XHR + fetch，过滤静态资源，postMessage/title 回传）');
 })();
 "#;
 
@@ -295,9 +426,24 @@ mod tests {
             other => panic!("诊断窗口初始地址不应再停在 tauri.localhost 跳板页: {:?}", other),
         }
     }
+
+    #[test]
+    fn diagnostic_script_does_not_send_custom_scheme_requests_from_external_page() {
+        assert!(
+            !super::DIAGNOSTIC_JS.contains("diag://count"),
+            "外部医院页面不能用 XHR/fetch 请求 diag://count，WebView2 会按 CORS 拦截"
+        );
+        assert!(
+            !super::DIAGNOSTIC_JS.contains("diag://collect"),
+            "外部医院页面不能用 XHR/fetch 请求 diag://collect，WebView2 会按 CORS 拦截"
+        );
+        assert!(super::DIAGNOSTIC_JS.contains("postMessage"));
+        assert!(super::DIAGNOSTIC_JS.contains("[DIAG:"));
+        assert!(super::DIAGNOSTIC_JS.contains("__resetDiagCapture"));
+    }
 }
 
-/// 触发诊断窗口发送数据（通过 eval 调用 JS → custom protocol）
+/// 触发诊断窗口发送数据（通过 eval 调用 JS；外部页由标题中转回传）
 pub fn trigger_data_collection(app: &AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("diagnostic")
