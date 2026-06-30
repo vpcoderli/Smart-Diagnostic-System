@@ -5,8 +5,9 @@ use std::{
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 static REDIRECT_TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+const MAX_CAPTURE_PAYLOAD_CHARS: usize = 512 * 20_000;
 
-/// 诊断窗口捕获的请求数据（旧 custom protocol 路径会写入这里，Windows 外部页主要走标题中转）
+/// 诊断窗口捕获的请求数据。
 pub struct CapturedDataStore {
     pub data: Mutex<Option<String>>,
     chunks: Mutex<HashMap<String, CaptureChunks>>,
@@ -32,6 +33,14 @@ impl CapturedDataStore {
         self.chunks.lock().unwrap().clear();
     }
 
+    pub fn store_data(&self, data: String) -> Result<(), String> {
+        if data.len() > MAX_CAPTURE_PAYLOAD_CHARS {
+            return Err(format!("诊断数据过大: {} chars", data.len()));
+        }
+        *self.data.lock().unwrap() = Some(data);
+        Ok(())
+    }
+
     pub fn store_chunk(
         &self,
         id: String,
@@ -54,6 +63,9 @@ impl CapturedDataStore {
         if data.len() > MAX_CHUNK_CHARS {
             return Err(format!("单个分片过大: {} chars", data.len()));
         }
+        if total.saturating_mul(MAX_CHUNK_CHARS) > MAX_CAPTURE_PAYLOAD_CHARS {
+            return Err(format!("分片总量过大: {} chunks", total));
+        }
 
         let mut chunks = self.chunks.lock().unwrap();
         let entry = chunks.entry(id.clone()).or_insert_with(|| CaptureChunks {
@@ -73,7 +85,7 @@ impl CapturedDataStore {
                 .map(|part| part.as_deref().unwrap_or(""))
                 .collect::<String>();
             chunks.remove(&id);
-            *self.data.lock().unwrap() = Some(json.clone());
+            self.store_data(json.clone())?;
             Ok(Some(json))
         } else {
             Ok(None)
@@ -103,8 +115,10 @@ const DIAGNOSTIC_JS: &str = r#"
   var _frameMessageType = 'smart-diag-frame-requests';
   var _dataMessageType = 'smart-diag-data-ready';
   var _resetMessageType = 'smart-diag-reset';
+  var _countEventName = 'smart-diag-capture-count';
+  var _dataEventName = 'smart-diag-capture-data';
   var _origTitle = document.title || '';
-  var _lastProtocolCount = null;
+  var _lastReportedCount = null;
 
   // ═══ 静态资源过滤 ═══
   var _staticExts = /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i;
@@ -130,44 +144,35 @@ const DIAGNOSTIC_JS: &str = r#"
     ].join('|');
   }
 
-  function _sendProtocol(path, params) {
+  function _emitToRust(eventName, payload) {
     try {
-      var query = Object.keys(params || {}).map(function(key) {
-        return encodeURIComponent(key) + '=' + encodeURIComponent(String(params[key]));
-      }).join('&');
-      var iframe = document.createElement('iframe');
-      iframe.style.display = 'none';
-      iframe.src = 'diag://' + path + (query ? '?' + query : '');
-      (document.documentElement || document.body).appendChild(iframe);
-      setTimeout(function() {
-        try { iframe.remove(); } catch(e) {}
-      }, 1500);
+      var eventApi = window.__TAURI__ && window.__TAURI__.event;
+      if (eventApi && typeof eventApi.emit === 'function') {
+        eventApi.emit(eventName, payload).catch(function(e) {
+          try { console.warn('[Smart-Diag] 事件回传失败:', e); } catch(_) {}
+        });
+        return true;
+      }
     } catch(e) {}
+    return false;
   }
 
-  function _sendCountProtocol(count) {
-    if (_lastProtocolCount === count) return;
-    _lastProtocolCount = count;
-    _sendProtocol('count', {
+  function _sendCountToRust(count) {
+    if (_lastReportedCount === count) return;
+    _lastReportedCount = count;
+    _emitToRust(_countEventName, {
       value: count,
+      pageUrl: window.__diag_page_url || location.href,
       t: Date.now()
     });
   }
 
-  function _sendDataProtocol(data) {
-    try {
-      var id = 'capture-' + Date.now() + '-' + Math.random().toString(36).slice(2);
-      var chunkSize = 3500;
-      var total = Math.max(1, Math.ceil(data.length / chunkSize));
-      for (var i = 0; i < total; i++) {
-        _sendProtocol('collect-chunk', {
-          id: id,
-          index: i,
-          total: total,
-          data: data.slice(i * chunkSize, (i + 1) * chunkSize)
-        });
-      }
-    } catch(e) {}
+  function _sendDataToRust(data) {
+    _emitToRust(_dataEventName, {
+      data: data,
+      pageUrl: window.__diag_page_url || location.href,
+      t: Date.now()
+    });
   }
 
   function _performanceRequests(skipUrls) {
@@ -273,7 +278,7 @@ const DIAGNOSTIC_JS: &str = r#"
     try {
       var base = (_origTitle || document.title || '').replace(/^\[DIAG:\d+\]\s*/, '');
       document.title = '[DIAG:' + count + '] ' + base;
-      _sendCountProtocol(count);
+      _sendCountToRust(count);
     } catch(e) {}
   }
 
@@ -456,7 +461,7 @@ const DIAGNOSTIC_JS: &str = r#"
     try {
       if (_isTop) {
         document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
-        _sendDataProtocol(data);
+        _sendDataToRust(data);
       } else {
         window.top.postMessage({
           type: _dataMessageType,
@@ -493,9 +498,8 @@ const DIAGNOSTIC_JS: &str = r#"
   });
 
   // ═══ 周期性刷新顶层计数 ═══
-  // 外部医院页面不能通过 XHR/fetch 访问 diag:// 自定义协议；WebView2 会按 CORS
-  // 拦截。因此 frame 内捕获的数据通过 postMessage 汇总到顶层页，顶层页再把计数
-  // 写进标题栏，供 Rust 侧轮询读取。
+  // frame 内捕获的数据通过 postMessage 汇总到顶层页，顶层页再通过 Tauri event IPC
+  // 回传给 Rust。标题栏只保留给人工观察，不作为 Windows 的可靠数据通道。
   setInterval(function() {
     try {
       if (_isTop) {
@@ -507,7 +511,7 @@ const DIAGNOSTIC_JS: &str = r#"
     } catch(e) {}
   }, 1000);
 
-  console.log('[Smart-Diag] API 捕获脚本已注入（XHR + fetch，过滤静态资源，postMessage/title 回传）');
+  console.log('[Smart-Diag] API 捕获脚本已注入（XHR + fetch，过滤静态资源，Tauri event 回传）');
 })();
 "#;
 
@@ -539,11 +543,18 @@ pub(crate) const FORCE_DIAGNOSTIC_COUNT_JS: &str = r#"
       return Object.keys(urls).length;
     }
     function sendCount(count) {
-      var iframe = document.createElement('iframe');
-      iframe.style.display = 'none';
-      iframe.src = 'diag://count?value=' + encodeURIComponent(String(count)) + '&t=' + Date.now();
-      (document.documentElement || document.body).appendChild(iframe);
-      setTimeout(function(){ try { iframe.remove(); } catch(e) {} }, 1500);
+      try {
+        var eventApi = window.__TAURI__ && window.__TAURI__.event;
+        if (eventApi && typeof eventApi.emit === 'function') {
+          eventApi.emit('smart-diag-capture-count', {
+            value: count,
+            pageUrl: window.__diag_page_url || location.href,
+            t: Date.now()
+          }).catch(function(e) {
+            try { console.warn('[Smart-Diag] 计数事件回传失败:', e); } catch(_) {}
+          });
+        }
+      } catch(e) {}
       try {
         document.title = '[DIAG:' + count + '] ' + String(document.title || '').replace(/^\[DIAG:\d+\]\s*/, '');
       } catch(e) {}
@@ -567,16 +578,6 @@ pub(crate) const FORCE_DIAGNOSTIC_SNAPSHOT_JS: &str = r#"
     }
     function key(req) {
       return [req.method || '', req.url || '', req.status == null ? '' : String(req.status), req.timestamp || '', req.requestType || ''].join('|');
-    }
-    function sendProtocol(path, params) {
-      var query = Object.keys(params || {}).map(function(k) {
-        return encodeURIComponent(k) + '=' + encodeURIComponent(String(params[k]));
-      }).join('&');
-      var iframe = document.createElement('iframe');
-      iframe.style.display = 'none';
-      iframe.src = 'diag://' + path + (query ? '?' + query : '');
-      (document.documentElement || document.body).appendChild(iframe);
-      setTimeout(function(){ try { iframe.remove(); } catch(e) {} }, 1500);
     }
     function pushUnique(all, seen, req) {
       var k = key(req);
@@ -617,18 +618,25 @@ pub(crate) const FORCE_DIAGNOSTIC_SNAPSHOT_JS: &str = r#"
       pageUrl: window.__diag_page_url || location.href,
       requests: all
     });
-    var id = 'force-' + Date.now() + '-' + Math.random().toString(36).slice(2);
-    var chunkSize = 3500;
-    var total = Math.max(1, Math.ceil(data.length / chunkSize));
-    for (var i = 0; i < total; i++) {
-      sendProtocol('collect-chunk', {
-        id: id,
-        index: i,
-        total: total,
-        data: data.slice(i * chunkSize, (i + 1) * chunkSize)
-      });
-    }
-    sendProtocol('count', { value: all.length, t: Date.now() });
+    try {
+      var eventApi = window.__TAURI__ && window.__TAURI__.event;
+      if (eventApi && typeof eventApi.emit === 'function') {
+        eventApi.emit('smart-diag-capture-data', {
+          data: data,
+          pageUrl: window.__diag_page_url || location.href,
+          t: Date.now()
+        }).catch(function(e) {
+          try { console.warn('[Smart-Diag] 快照事件回传失败:', e); } catch(_) {}
+        });
+        eventApi.emit('smart-diag-capture-count', {
+          value: all.length,
+          pageUrl: window.__diag_page_url || location.href,
+          t: Date.now()
+        }).catch(function(e) {
+          try { console.warn('[Smart-Diag] 计数事件回传失败:', e); } catch(_) {}
+        });
+      }
+    } catch(e) {}
     try {
       document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
     } catch(e) {}
@@ -748,13 +756,48 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_script_has_navigation_protocol_and_performance_fallbacks() {
-        assert!(super::DIAGNOSTIC_JS.contains("document.createElement('iframe')"));
-        assert!(super::DIAGNOSTIC_JS.contains("iframe.src = 'diag://' + path"));
-        assert!(super::DIAGNOSTIC_JS.contains("_sendProtocol('count'"));
-        assert!(super::DIAGNOSTIC_JS.contains("_sendProtocol('collect-chunk'"));
+    fn diagnostic_scripts_use_tauri_events_instead_of_launching_custom_scheme_urls() {
+        for script in [
+            super::DIAGNOSTIC_JS,
+            super::FORCE_DIAGNOSTIC_COUNT_JS,
+            super::FORCE_DIAGNOSTIC_SNAPSHOT_JS,
+        ] {
+            assert!(
+                script.contains("window.__TAURI__") && script.contains("eventApi.emit"),
+                "诊断页应通过 Tauri event IPC 回传，避免 Windows WebView2 启动外部协议"
+            );
+            assert!(
+                !script.contains("iframe.src = 'diag://"),
+                "Windows WebView2 会拦截 diag:// iframe 导航，导致主窗口计数一直为 0"
+            );
+            assert!(
+                !script.contains("collect-chunk"),
+                "IPC 回传不需要 URL 分片，避免再次触发自定义协议导航"
+            );
+        }
+        assert!(super::DIAGNOSTIC_JS.contains("smart-diag-capture-count"));
+        assert!(super::DIAGNOSTIC_JS.contains("smart-diag-capture-data"));
         assert!(super::DIAGNOSTIC_JS.contains("performance.getEntriesByType('resource')"));
         assert!(super::DIAGNOSTIC_JS.contains("initiatorType"));
+    }
+
+    #[test]
+    fn diagnostic_capability_allows_remote_event_emit_only() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/diagnostic.json")).unwrap();
+        let permissions = capability["permissions"].as_array().unwrap();
+        assert!(permissions
+            .iter()
+            .any(|p| p.as_str() == Some("core:event:allow-emit")));
+        assert!(
+            !permissions
+                .iter()
+                .any(|p| p.as_str() == Some("core:event:default")),
+            "诊断远程页只需要 emit，不能获得 listen/unlisten 等完整事件权限"
+        );
+        let urls = capability["remote"]["urls"].as_array().unwrap();
+        assert!(urls.iter().any(|u| u.as_str() == Some("http://*:*/*")));
+        assert!(urls.iter().any(|u| u.as_str() == Some("https://*:*/*")));
     }
 
     #[test]
@@ -775,9 +818,23 @@ mod tests {
         );
         assert_eq!(store.data.lock().unwrap().as_deref(), Some("foobar"));
     }
+
+    #[test]
+    fn captured_store_stores_direct_event_payloads() {
+        let store = super::CapturedDataStore::default();
+
+        store
+            .store_data(r#"{"pageUrl":"http://host","requests":[]}"#.to_string())
+            .unwrap();
+
+        assert_eq!(
+            store.data.lock().unwrap().as_deref(),
+            Some(r#"{"pageUrl":"http://host","requests":[]}"#)
+        );
+    }
 }
 
-/// 触发诊断窗口发送数据（通过 eval 调用 JS；外部页由标题中转回传）
+/// 触发诊断窗口发送数据（通过 eval 调用 JS；外部页由 Tauri event IPC 回传）
 pub fn trigger_data_collection(app: &AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("diagnostic")

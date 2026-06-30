@@ -64,13 +64,15 @@ pub fn run() {
 
     tracing::info!("Smart Diagnostic Collector 启动中...");
 
-    // 捕获数据存储 — 诊断窗口通过 custom protocol 将数据写入此处
+    // 捕获数据存储 — 诊断窗口通过 Tauri event IPC 将数据写入此处
     let captured_store = std::sync::Arc::new(CapturedDataStore::default());
     let captured_store_for_protocol = captured_store.clone();
+    let captured_store_for_events = captured_store.clone();
 
     // 请求计数存储 — 实时更新前端请求计数
     let request_count: std::sync::Arc<Mutex<usize>> = std::sync::Arc::new(Mutex::new(0));
     let count_for_protocol = request_count.clone();
+    let count_for_events = request_count.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -86,8 +88,39 @@ pub fn run() {
         .manage(captured_store)
         .manage(request_count)
         // ── setup 钩子：应用初始化后用正确的 app_data_dir 加载已保存配置 ──
-        .setup(|app| {
-            use tauri::Manager;
+        .setup(move |app| {
+            use tauri::{Listener, Manager};
+
+            let data_store = captured_store_for_events.clone();
+            app.listen_any("smart-diag-capture-data", move |event| {
+                let payload: serde_json::Value =
+                    serde_json::from_str(event.payload()).unwrap_or(serde_json::Value::Null);
+                let data = payload
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| payload.as_str());
+                if let Some(data) = data {
+                    match data_store.store_data(data.to_string()) {
+                        Ok(()) => tracing::info!("收到诊断事件数据: {} bytes", data.len()),
+                        Err(e) => tracing::warn!("诊断事件数据无效: {}", e),
+                    }
+                }
+            });
+
+            let count_store = count_for_events.clone();
+            app.listen_any("smart-diag-capture-count", move |event| {
+                let payload: serde_json::Value =
+                    serde_json::from_str(event.payload()).unwrap_or(serde_json::Value::Null);
+                let count = payload
+                    .get("value")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| payload.as_u64());
+                if let Some(count) = count.and_then(|n| usize::try_from(n).ok()) {
+                    tracing::info!("诊断事件更新计数: {}", count);
+                    *count_store.lock().unwrap() = count;
+                }
+            });
+
             if let Ok(data_dir) = app.path().app_data_dir() {
                 match crate::config_store::load_config(&data_dir) {
                     Ok(manifest) => {
@@ -157,7 +190,9 @@ pub fn run() {
                 let data = decode_diag_collect_payload(&uri, &body);
                 if !data.is_empty() {
                     tracing::info!("收到诊断数据: {} bytes", data.len());
-                    *captured_store_for_protocol.data.lock().unwrap() = Some(data);
+                    if let Err(e) = captured_store_for_protocol.store_data(data) {
+                        tracing::warn!("诊断数据无效: {}", e);
+                    }
                 }
                 let response = http::Response::builder()
                     .status(200)

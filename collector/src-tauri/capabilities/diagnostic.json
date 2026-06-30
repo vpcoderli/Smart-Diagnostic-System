@@ -1,6 +1,14 @@
 {
   "identifier": "diagnostic-capability",
-  "description": "Diagnostic browser window — external URL, no Tauri IPC needed",
+  "description": "Diagnostic browser window — remote page can emit capture data back to Rust only",
   "windows": ["diagnostic"],
-  "permissions": []
+  "remote": {
+    "urls": [
+      "http://*:*/*",
+      "https://*:*/*",
+      "http://*/*",
+      "https://*/*"
+    ]
+  },
+  "permissions": ["core:event:allow-emit"]
 }

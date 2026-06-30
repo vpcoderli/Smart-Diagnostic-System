@@ -506,7 +506,7 @@ pub async fn open_diag_browser(
 }
 
 /// 从诊断浏览器收集捕获的请求数据
-/// 外部医院页面在 Windows WebView2 中不能用 XHR/fetch 访问 diag://，因此优先读取标题中转数据。
+/// 外部医院页面在 Windows WebView2 中会拦截 diag:// 外部协议，因此优先读取 Tauri event IPC 回传数据。
 #[tauri::command]
 pub async fn collect_diag_data(
     app: tauri::AppHandle,
@@ -521,7 +521,7 @@ pub async fn collect_diag_data(
         .get_webview_window("diagnostic")
         .ok_or("诊断窗口未打开")?;
 
-    // 触发诊断窗口发送数据（Windows 外部页通过导航式 diag:// 分片回传，旧路径仍可写入 captured_store）
+    // 触发诊断窗口发送数据（Windows 外部页通过 Tauri event IPC 回写 captured_store）
     crate::webview_capture::trigger_data_collection(&app)?;
     let _ = window.eval(crate::webview_capture::FORCE_DIAGNOSTIC_SNAPSHOT_JS);
 
@@ -550,7 +550,7 @@ pub async fn collect_diag_data(
         }
     }
 
-    // Fallback 2: 直接写标题，避开 custom scheme 的 CORS/协议限制。
+    // Fallback 2: 直接写标题，兼容旧版本标题中转。
     tracing::warn!("诊断脚本回传超时，尝试直接 title 中转...");
     let _ = window.eval(
         r#"
@@ -575,7 +575,7 @@ pub async fn collect_diag_data(
 }
 
 /// 获取当前捕获的请求计数（实时轮询用）
-/// Windows 外部页通过标题回传计数；旧 custom protocol 计数器作为兜底。
+/// Windows 外部页通过 Tauri event IPC 回传计数；标题只作为旧版本兜底。
 #[tauri::command]
 pub async fn get_capture_count(
     count: State<'_, std::sync::Arc<std::sync::Mutex<usize>>>,
