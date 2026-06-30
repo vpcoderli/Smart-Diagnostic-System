@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>诊断浏览器 v9</title>
+<title>诊断浏览器 v10</title>
 <style>
   html, body {
     background: #11131f; color: #e6e8ef; margin: 0; height: 100%;
@@ -33,64 +33,128 @@
 </style>
 </head>
 <body>
-  <div class="ver">DIAG v9</div>
+  <div class="ver">DIAG v10</div>
   <div class="wrap">
-    <div class="title">🔍 诊断浏览器</div>
-    <div id="status">正在自动打开诊断页面…</div>
-    <a id="gobtn" class="gobtn" href="#" rel="noopener" style="display:none">🔗 点击进入诊断页面</a>
+    <div class="title">诊断浏览器</div>
+    <div id="status">正在读取诊断页面地址...</div>
+    <a id="gobtn" class="gobtn" href="#" rel="noopener" style="display:none">点击进入诊断页面</a>
     <div class="url" id="urlText"></div>
-    <div class="hint">若页面未自动跳转，请点击上方蓝色按钮进入</div>
+    <div class="hint">若页面未自动跳转，请点击上方按钮进入</div>
   </div>
 <script>
 (function () {
-  // initialization_script 已在本页加载前设置 window.__DIAG_TARGET__。
-  // 本脚本是「普通页面脚本」，与用户在 DevTools 控制台执行同一上下文 —— 拥有完整
-  // 导航权限，不受 WebView2 对 init script 的跨源导航限制。
+  'use strict';
   var attempts = 0;
+  var target = '';
 
-  function ready(t) {
+  function setStatus(text) {
+    var s = document.getElementById('status');
+    if (s) s.textContent = text;
+  }
+
+  function isHttpUrl(value) {
+    return /^https?:\/\//i.test(value || '');
+  }
+
+  function stillOnBridge() {
+    try {
+      return location.hostname === 'tauri.localhost' || location.protocol === 'tauri:' || location.protocol === 'file:';
+    } catch (e) {
+      return true;
+    }
+  }
+
+  function showReady() {
     var btn = document.getElementById('gobtn');
     var urlText = document.getElementById('urlText');
-    btn.href = t;
-    btn.style.display = 'inline-block';
-    urlText.textContent = t;
-    // 点击 = 真实用户手势导航，必定生效（与控制台等价）
-    btn.addEventListener('click', function (e) {
-      e.preventDefault();
-      try { window.location.href = t; } catch (err) {}
-    });
-    // 先自动尝试（多数情况下足够）
-    autoGo(t);
+    if (btn) {
+      btn.href = target;
+      btn.style.display = 'inline-block';
+      if (btn.dataset.bound !== '1') {
+        btn.dataset.bound = '1';
+        btn.addEventListener('click', function (e) {
+          e.preventDefault();
+          navigate();
+        });
+      }
+    }
+    if (urlText) urlText.textContent = target;
   }
 
-  function autoGo(t) {
-    try { window.location.replace(t); } catch (e) {}
-    // 若 250ms 后仍停在跳板页，说明自动被拦，提示用户点击
-    setTimeout(function () {
-      try {
-        if (location.hostname === 'tauri.localhost') {
-          var s = document.getElementById('status');
-          if (s) s.textContent = '自动跳转被拦截 — 请点击下方按钮进入 ↓';
-          try { window.location.href = t; } catch (e) {}
-        }
-      } catch (e) {}
-    }, 250);
-  }
-
-  function boot() {
-    var t = window.__DIAG_TARGET__;
-    if (!t) {
-      if (attempts++ < 150) { setTimeout(boot, 30); return; }
-      document.getElementById('status').textContent = '未获取到目标地址（__DIAG_TARGET__ 为空）';
+  function navigate() {
+    if (!isHttpUrl(target)) {
+      setStatus('目标地址无效，请回主窗口重新打开诊断浏览器');
       return;
     }
-    ready(t);
+    try {
+      window.location.replace(target);
+    } catch (e) {
+      try { window.location.href = target; } catch (e2) {}
+    }
+  }
+
+  function onTargetLoaded(value) {
+    target = (value || '').trim();
+    if (!isHttpUrl(target)) {
+      setStatus('未获取到目标地址，请回主窗口重新打开诊断浏览器');
+      return;
+    }
+    showReady();
+    setStatus('正在自动打开诊断页面...');
+    navigate();
+    setTimeout(function () {
+      if (stillOnBridge()) {
+        setStatus('自动跳转被拦截 - 请点击下方按钮进入');
+        try { window.location.href = target; } catch (e) {}
+      }
+    }, 300);
+  }
+
+  function parseTargetResponse(text) {
+    try {
+      var payload = JSON.parse(text || '{}');
+      return payload.target || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function loadTargetWithXhr() {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', 'diag://redirect-target', true);
+      xhr.onload = function () { onTargetLoaded(parseTargetResponse(xhr.responseText)); };
+      xhr.onerror = retryLoadTarget;
+      xhr.send();
+    } catch (e) {
+      retryLoadTarget();
+    }
+  }
+
+  function retryLoadTarget() {
+    attempts += 1;
+    if (attempts > 80) {
+      setStatus('读取目标地址失败，请回主窗口重新打开诊断浏览器');
+      return;
+    }
+    setTimeout(loadTarget, 50);
+  }
+
+  function loadTarget() {
+    try {
+      fetch('diag://redirect-target')
+        .then(function (resp) { return resp.text(); })
+        .then(function (text) { onTargetLoaded(parseTargetResponse(text)); })
+        .catch(loadTargetWithXhr);
+    } catch (e) {
+      loadTargetWithXhr();
+    }
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
+    document.addEventListener('DOMContentLoaded', loadTarget);
   } else {
-    boot();
+    loadTarget();
   }
 })();
 </script>

@@ -455,7 +455,7 @@ pub fn confirm_validation(
 
 /// 打开诊断浏览器窗口（加载目标 URL，注入 fetch/XHR 拦截 JS）
 #[tauri::command]
-pub fn open_diag_browser(
+pub async fn open_diag_browser(
     url: String,
     app: tauri::AppHandle,
     captured_store: State<'_, std::sync::Arc<crate::webview_capture::CapturedDataStore>>,

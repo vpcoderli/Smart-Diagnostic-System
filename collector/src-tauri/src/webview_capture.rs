@@ -1,6 +1,7 @@
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+
+static REDIRECT_TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// 诊断窗口捕获的请求数据（通过 custom protocol 回传）
 #[derive(Default)]
@@ -204,6 +205,27 @@ const DIAGNOSTIC_JS: &str = r#"
 })();
 "#;
 
+fn redirect_target_store() -> &'static Mutex<Option<String>> {
+    REDIRECT_TARGET.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_diagnostic_redirect_target(target: String) {
+    *redirect_target_store().lock().unwrap() = Some(target);
+}
+
+pub(crate) fn diagnostic_redirect_target_json() -> String {
+    let target = redirect_target_store()
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default();
+    serde_json::json!({ "target": target }).to_string()
+}
+
+fn diagnostic_window_url(target: &url::Url) -> WebviewUrl {
+    WebviewUrl::External(target.clone())
+}
+
 /// 打开诊断浏览器窗口
 pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window("diagnostic") {
@@ -213,37 +235,18 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
 
     let parsed_url: url::Url = url.parse().map_err(|e| format!("URL 格式无效: {}", e))?;
 
-    const NAV_TAG: &str = "v9";
+    const NAV_TAG: &str = "v10";
     let friendly_title =
-        "🔍 诊断浏览器【v9】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
+        "🔍 诊断浏览器【v10】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
     let target_host = parsed_url.host_str().map(|s| s.to_string());
-
-    // ── v8 核心方案：跳板页 + 页面自身脚本跳转 ──
-    //
-    // v2-v7 全部失败的根因：
-    //   - WebView2 宿主级安全限制：AddScriptToExecuteOnDocumentCreated（init script）中
-    //     发起的跨源导航被静默拒绝，无论是 location.replace / setInterval 轮询均无效。
-    //   - Rust navigate() / eval() 消息通道对该窗口同样失效。
-    //
-    // 已知有效路径（用户手动控制台验证）：
-    //   在 tauri.localhost 页面的「普通页面脚本」中调用 location.replace() → 成功跳转。
-    //
-    // v8 方案：
-    //   1. 用 WebviewUrl::App 加载本地跳板页 diagnostic-redirect.html（非 External URL）
-    //   2. initialization_script 只做一件事：设置 window.__DIAG_TARGET__ = url（属性赋值，
-    //      不是导航，无任何限制）以及注入 DIAGNOSTIC_JS 抓包逻辑
-    //   3. 跳板页的 <script>（普通页面脚本，与用户控制台等价）读取 __DIAG_TARGET__ 并
-    //      调用 location.replace() → 成功跳转到医院页面
-    //   4. 医院页面加载时 initialization_script 再次运行，DIAGNOSTIC_JS 正常拦截 API
-    let set_target_js = format!("window.__DIAG_TARGET__ = {:?};", url);
-    let init_script = format!("{}\n{}", set_target_js, DIAGNOSTIC_JS);
+    set_diagnostic_redirect_target(parsed_url.as_str().to_string());
 
     let _window =
-        WebviewWindowBuilder::new(app, "diagnostic", WebviewUrl::App(PathBuf::from("diagnostic-redirect.html")))
+        WebviewWindowBuilder::new(app, "diagnostic", diagnostic_window_url(&parsed_url))
             .title(friendly_title)
             .inner_size(1280.0, 900.0)
             .center()
-            .initialization_script(&init_script)
+            .initialization_script(DIAGNOSTIC_JS)
             .devtools(true)
             .on_navigation(|u| {
                 tracing::info!("诊断窗口 on_navigation -> {}", u);
@@ -265,6 +268,33 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
 
     tracing::info!("诊断浏览器已打开: {}", url);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn redirect_target_json_returns_latest_target_url() {
+        super::set_diagnostic_redirect_target(
+            "http://172.29.60.151/patient-management/login?next=/gateway/a&name=张三".to_string(),
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_str(&super::diagnostic_redirect_target_json()).unwrap();
+        assert_eq!(
+            value["target"].as_str(),
+            Some("http://172.29.60.151/patient-management/login?next=/gateway/a&name=张三")
+        );
+    }
+
+    #[test]
+    fn diagnostic_window_uses_target_url_as_initial_url() {
+        let target = url::Url::parse("http://172.29.60.151/patient-management").unwrap();
+
+        match super::diagnostic_window_url(&target) {
+            tauri::WebviewUrl::External(actual) => assert_eq!(actual, target),
+            other => panic!("诊断窗口初始地址不应再停在 tauri.localhost 跳板页: {:?}", other),
+        }
+    }
 }
 
 /// 触发诊断窗口发送数据（通过 eval 调用 JS → custom protocol）

@@ -92,7 +92,18 @@ pub fn run() {
 
             tracing::debug!("diag:// 协议收到请求: uri={}, body_len={}", uri, body.len());
 
-            if uri.contains("collect") {
+            if uri.contains("redirect-target") {
+                let body = crate::webview_capture::diagnostic_redirect_target_json();
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Access-Control-Allow-Methods", "GET, OPTIONS")
+                    .header("Access-Control-Allow-Headers", "Content-Type")
+                    .body(body.into_bytes())
+                    .unwrap();
+                responder.respond(response);
+            } else if uri.contains("collect") {
                 let data = decode_diag_collect_payload(&body);
                 if !data.is_empty() {
                     tracing::info!("收到诊断数据: {} bytes", data.len());
