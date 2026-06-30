@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// 诊断窗口捕获的请求数据（通过 custom protocol 回传）
@@ -202,11 +203,21 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
     let parsed_url: url::Url = url.parse().map_err(|e| format!("URL 格式无效: {}", e))?;
 
     // 版本标记：用于在标题栏肉眼确认运行的是最新二进制（排除旧安装包干扰）。
-    const NAV_TAG: &str = "v4";
+    const NAV_TAG: &str = "v5";
     let friendly_title =
-        "🔍 诊断浏览器【v4】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
+        "🔍 诊断浏览器【v5】 — 请操作页面复现问题，完成后返回主窗口点击「采集完成」";
     let target_host = parsed_url.host_str().map(|s| s.to_string());
+    // 用 location.replace 触发的「页内导航」JS。注意：实测 Rust 侧 navigate()
+    // 对该窗口无效（窗口始终停在 app 自身 tauri.localhost）。location.replace 是
+    // 在已加载文档的 JS 上下文里发起的真正页内导航，WebView2 必然执行，是与
+    // navigate() 完全不同的通道。{:?} 把 URL 转成合法的 JS 字符串字面量。
+    let nav_js = format!("window.location.replace({:?})", parsed_url.as_str());
+    // 是否已到达目标页（由 on_page_load 用 payload 的真实地址置位，可靠，
+    // 不依赖在 Windows 上不稳的 webview.url()）。
+    let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let reached_cb = reached.clone();
+    let nav_js_cb = nav_js.clone();
     let _window =
         WebviewWindowBuilder::new(app, "diagnostic", WebviewUrl::External(parsed_url.clone()))
             .title(friendly_title)
@@ -219,50 +230,44 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
                 true
             })
             .on_page_load(move |window, payload| {
-                // 把每一次页面事件的真实地址写进标题栏 —— 无需 devtools 即可看到
-                // WebView2 究竟加载了什么、以及兜底导航是否生效。
                 let loaded = payload.url().clone();
-                tracing::info!("诊断窗口 on_page_load [{:?}] -> {}", payload.event(), loaded);
+                let event = payload.event();
+                tracing::info!("诊断窗口 on_page_load [{:?}] -> {}", event, loaded);
                 let on_target = loaded.host_str().map(|s| s.to_string()) == target_host;
                 if on_target {
+                    // 已到目标页：置位、恢复友好标题
+                    reached_cb.store(true, std::sync::atomic::Ordering::SeqCst);
                     let _ = window.set_title(friendly_title);
                 } else {
+                    // 仍停在 app/空白页：标题暴露真实地址；文档加载完成后在页面
+                    // 上下文里用 location.replace 跳到目标（比 navigate() 可靠）。
                     let _ = window
                         .set_title(&format!("诊断浏览器【{}】[加载: {}]", NAV_TAG, loaded));
+                    if matches!(event, PageLoadEvent::Finished) {
+                        tracing::warn!("诊断窗口停在 {}，eval location.replace 跳转目标", loaded);
+                        let _ = window.eval(&nav_js_cb);
+                    }
                 }
             })
             .build()
             .map_err(|e| format!("创建诊断窗口失败: {}", e))?;
 
-    // 重试式兜底导航：
-    // Windows WebView2 在新建 webview、尤其是慢速虚拟机里，对外部 URL 的导航
-    // （无论是初始 External 还是随后的 navigate()）在 webview 未完全就绪时会被
-    // 静默丢弃，窗口停在 app 自身地址 tauri.localhost，表现为空白页。
-    // 单发一次 navigate() 不可靠（可能恰好在就绪前发出）。这里改为轮询重试：
-    // 每 1.2s 检查当前 host，未到目标就再 navigate() 一次，直到落到目标或超过
-    // 上限。总窗口约 12s，足以覆盖虚拟机的 WebView2 冷启动。
+    // 重试式兜底（eval 通道）：
+    // 即便 on_page_load 因外部首跳被静默取消而从未对 app 页触发，这个线程也会
+    // 周期性地在当前文档里 eval location.replace 把它推向目标。每 1.2s 一次，
+    // 一旦 on_page_load 观察到已落在目标 host（reached 置位）即停止，避免对已
+    // 到达目标页的窗口反复刷新。总窗口约 12s，覆盖虚拟机 WebView2 冷启动。
     {
         let wnd = _window.clone();
-        let nav_url = parsed_url.clone();
-        let want_host = parsed_url.host_str().map(|s| s.to_string());
+        let nav_js_th = nav_js.clone();
+        let reached_th = reached.clone();
         std::thread::spawn(move || {
-            for attempt in 1..=10u32 {
+            for _ in 1..=10u32 {
                 std::thread::sleep(std::time::Duration::from_millis(1200));
-                let cur_host = wnd
-                    .url()
-                    .ok()
-                    .and_then(|u| u.host_str().map(|s| s.to_string()));
-                if cur_host == want_host {
-                    tracing::info!("诊断窗口已在目标 host（第 {} 次检查），停止兜底", attempt);
+                if reached_th.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
-                tracing::warn!(
-                    "诊断窗口第 {} 次兜底：当前 host={:?} != 目标 {:?}，强制导航",
-                    attempt, cur_host, want_host
-                );
-                if let Err(e) = wnd.navigate(nav_url.clone()) {
-                    tracing::warn!("诊断窗口兜底导航调用失败: {}", e);
-                }
+                let _ = wnd.eval(&nav_js_th);
             }
         });
     }
