@@ -1,12 +1,84 @@
-use std::sync::{Mutex, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 static REDIRECT_TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// 诊断窗口捕获的请求数据（旧 custom protocol 路径会写入这里，Windows 外部页主要走标题中转）
-#[derive(Default)]
 pub struct CapturedDataStore {
     pub data: Mutex<Option<String>>,
+    chunks: Mutex<HashMap<String, CaptureChunks>>,
+}
+
+struct CaptureChunks {
+    total: usize,
+    parts: Vec<Option<String>>,
+}
+
+impl Default for CapturedDataStore {
+    fn default() -> Self {
+        Self {
+            data: Mutex::new(None),
+            chunks: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl CapturedDataStore {
+    pub fn clear(&self) {
+        *self.data.lock().unwrap() = None;
+        self.chunks.lock().unwrap().clear();
+    }
+
+    pub fn store_chunk(
+        &self,
+        id: String,
+        index: usize,
+        total: usize,
+        data: String,
+    ) -> Result<Option<String>, String> {
+        const MAX_CHUNKS: usize = 512;
+        const MAX_CHUNK_CHARS: usize = 20_000;
+
+        if id.is_empty() {
+            return Err("分片 ID 为空".to_string());
+        }
+        if total == 0 || total > MAX_CHUNKS {
+            return Err(format!("分片数量异常: {}", total));
+        }
+        if index >= total {
+            return Err(format!("分片序号越界: {}/{}", index, total));
+        }
+        if data.len() > MAX_CHUNK_CHARS {
+            return Err(format!("单个分片过大: {} chars", data.len()));
+        }
+
+        let mut chunks = self.chunks.lock().unwrap();
+        let entry = chunks.entry(id.clone()).or_insert_with(|| CaptureChunks {
+            total,
+            parts: vec![None; total],
+        });
+        if entry.total != total {
+            chunks.remove(&id);
+            return Err("同一分片 ID 的总片数不一致".to_string());
+        }
+
+        entry.parts[index] = Some(data);
+        if entry.parts.iter().all(|part| part.is_some()) {
+            let json = entry
+                .parts
+                .iter()
+                .map(|part| part.as_deref().unwrap_or(""))
+                .collect::<String>();
+            chunks.remove(&id);
+            *self.data.lock().unwrap() = Some(json.clone());
+            Ok(Some(json))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// 诊断 JS 注入脚本 —— 拦截 XHR 和 fetch API 请求（过滤静态资源）
@@ -32,6 +104,7 @@ const DIAGNOSTIC_JS: &str = r#"
   var _dataMessageType = 'smart-diag-data-ready';
   var _resetMessageType = 'smart-diag-reset';
   var _origTitle = document.title || '';
+  var _lastProtocolCount = null;
 
   // ═══ 静态资源过滤 ═══
   var _staticExts = /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i;
@@ -57,6 +130,96 @@ const DIAGNOSTIC_JS: &str = r#"
     ].join('|');
   }
 
+  function _sendProtocol(path, params) {
+    try {
+      var query = Object.keys(params || {}).map(function(key) {
+        return encodeURIComponent(key) + '=' + encodeURIComponent(String(params[key]));
+      }).join('&');
+      var iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.src = 'diag://' + path + (query ? '?' + query : '');
+      (document.documentElement || document.body).appendChild(iframe);
+      setTimeout(function() {
+        try { iframe.remove(); } catch(e) {}
+      }, 1500);
+    } catch(e) {}
+  }
+
+  function _sendCountProtocol(count) {
+    if (_lastProtocolCount === count) return;
+    _lastProtocolCount = count;
+    _sendProtocol('count', {
+      value: count,
+      t: Date.now()
+    });
+  }
+
+  function _sendDataProtocol(data) {
+    try {
+      var id = 'capture-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+      var chunkSize = 3500;
+      var total = Math.max(1, Math.ceil(data.length / chunkSize));
+      for (var i = 0; i < total; i++) {
+        _sendProtocol('collect-chunk', {
+          id: id,
+          index: i,
+          total: total,
+          data: data.slice(i * chunkSize, (i + 1) * chunkSize)
+        });
+      }
+    } catch(e) {}
+  }
+
+  function _performanceRequests(skipUrls) {
+    var requests = [];
+    try {
+      var entries = performance.getEntriesByType('resource') || [];
+      entries.forEach(function(entry) {
+        var initiator = entry.initiatorType || 'performance';
+        if (initiator !== 'fetch' && initiator !== 'xmlhttprequest' && initiator !== 'beacon') return;
+        if (!_shouldCapture(entry.name)) return;
+        if (skipUrls && skipUrls[entry.name]) return;
+        var startedAt = Date.now();
+        if (performance.timeOrigin && entry.startTime != null) {
+          startedAt = Math.round(performance.timeOrigin + entry.startTime);
+        }
+        requests.push({
+          method: 'GET',
+          url: entry.name,
+          status: entry.responseStatus || 0,
+          durationMs: Math.max(0, Math.round(entry.duration || 0)),
+          traceId: null,
+          timestamp: new Date(startedAt).toISOString(),
+          requestType: initiator,
+          responseSize: entry.transferSize || entry.encodedBodySize || entry.decodedBodySize || null
+        });
+      });
+    } catch(e) {}
+    return requests;
+  }
+
+  function _localRequestsWithPerformance() {
+    var seen = {};
+    var skipUrls = {};
+    var all = [];
+    (window.__diag_requests || []).forEach(function(req) {
+      var key = _requestKey(req);
+      if (req && req.url) skipUrls[req.url] = true;
+      if (!seen[key]) {
+        seen[key] = true;
+        all.push(req);
+      }
+    });
+    _performanceRequests(skipUrls).forEach(function(req) {
+      var key = _requestKey(req);
+      if (!seen[key]) {
+        seen[key] = true;
+        all.push(req);
+      }
+    });
+    return all;
+  }
+
   function _ensureTopStores() {
     if (!_isTop) return;
     window.__diag_frame_requests = window.__diag_frame_requests || {};
@@ -74,24 +237,33 @@ const DIAGNOSTIC_JS: &str = r#"
   }
 
   function _allRequests() {
-    if (!_isTop) return window.__diag_requests || [];
+    if (!_isTop) return _localRequestsWithPerformance();
     _ensureTopStores();
     _mergeFramePayload({
       frameId: _frameId,
       pageUrl: window.__diag_page_url || location.href,
-      requests: window.__diag_requests || []
+      requests: _localRequestsWithPerformance()
     });
 
     var seen = {};
+    var skipUrls = {};
     var all = [];
     Object.keys(window.__diag_frame_requests).forEach(function(frameId) {
       (window.__diag_frame_requests[frameId] || []).forEach(function(req) {
         var key = _requestKey(req);
+        if (req && req.url) skipUrls[req.url] = true;
         if (!seen[key]) {
           seen[key] = true;
           all.push(req);
         }
       });
+    });
+    _performanceRequests(skipUrls).forEach(function(req) {
+      var key = _requestKey(req);
+      if (!seen[key]) {
+        seen[key] = true;
+        all.push(req);
+      }
     });
     return all;
   }
@@ -101,6 +273,7 @@ const DIAGNOSTIC_JS: &str = r#"
     try {
       var base = (_origTitle || document.title || '').replace(/^\[DIAG:\d+\]\s*/, '');
       document.title = '[DIAG:' + count + '] ' + base;
+      _sendCountProtocol(count);
     } catch(e) {}
   }
 
@@ -126,6 +299,7 @@ const DIAGNOSTIC_JS: &str = r#"
   function _resetLocalCapture() {
     window.__diag_requests = [];
     window.__diag_page_url = location.href;
+    try { performance.clearResourceTimings(); } catch(e) {}
     if (_isTop) {
       window.__diag_frame_requests = {};
       window.__diag_frame_pages = {};
@@ -272,7 +446,7 @@ const DIAGNOSTIC_JS: &str = r#"
   window.__getDiagData = function() {
     return JSON.stringify({
       pageUrl: window.__diag_page_url || location.href,
-      requests: _isTop ? _allRequests() : (window.__diag_requests || [])
+      requests: _isTop ? _allRequests() : _localRequestsWithPerformance()
     });
   };
 
@@ -282,6 +456,7 @@ const DIAGNOSTIC_JS: &str = r#"
     try {
       if (_isTop) {
         document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
+        _sendDataProtocol(data);
       } else {
         window.top.postMessage({
           type: _dataMessageType,
@@ -336,6 +511,131 @@ const DIAGNOSTIC_JS: &str = r#"
 })();
 "#;
 
+pub(crate) const FORCE_DIAGNOSTIC_COUNT_JS: &str = r#"
+(function() {
+  try {
+    function isStatic(url) {
+      try {
+        var u = new URL(url, location.href);
+        return /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i.test(u.pathname);
+      } catch(e) { return false; }
+    }
+    function shouldCapture(url) {
+      return !!url && url.indexOf('diag://') !== 0 && !isStatic(url);
+    }
+    function perfCount() {
+      var urls = {};
+      (window.__diag_requests || []).forEach(function(req) {
+        if (req && req.url) urls[req.url] = true;
+      });
+      try {
+        (performance.getEntriesByType('resource') || []).forEach(function(entry) {
+          var t = entry.initiatorType || '';
+          if ((t === 'fetch' || t === 'xmlhttprequest' || t === 'beacon') && shouldCapture(entry.name)) {
+            urls[entry.name] = true;
+          }
+        });
+      } catch(e) {}
+      return Object.keys(urls).length;
+    }
+    function sendCount(count) {
+      var iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.src = 'diag://count?value=' + encodeURIComponent(String(count)) + '&t=' + Date.now();
+      (document.documentElement || document.body).appendChild(iframe);
+      setTimeout(function(){ try { iframe.remove(); } catch(e) {} }, 1500);
+      try {
+        document.title = '[DIAG:' + count + '] ' + String(document.title || '').replace(/^\[DIAG:\d+\]\s*/, '');
+      } catch(e) {}
+    }
+    sendCount(perfCount());
+  } catch(e) {}
+})();
+"#;
+
+pub(crate) const FORCE_DIAGNOSTIC_SNAPSHOT_JS: &str = r#"
+(function() {
+  try {
+    function isStatic(url) {
+      try {
+        var u = new URL(url, location.href);
+        return /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i.test(u.pathname);
+      } catch(e) { return false; }
+    }
+    function shouldCapture(url) {
+      return !!url && url.indexOf('diag://') !== 0 && !isStatic(url);
+    }
+    function key(req) {
+      return [req.method || '', req.url || '', req.status == null ? '' : String(req.status), req.timestamp || '', req.requestType || ''].join('|');
+    }
+    function sendProtocol(path, params) {
+      var query = Object.keys(params || {}).map(function(k) {
+        return encodeURIComponent(k) + '=' + encodeURIComponent(String(params[k]));
+      }).join('&');
+      var iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.src = 'diag://' + path + (query ? '?' + query : '');
+      (document.documentElement || document.body).appendChild(iframe);
+      setTimeout(function(){ try { iframe.remove(); } catch(e) {} }, 1500);
+    }
+    function pushUnique(all, seen, req) {
+      var k = key(req);
+      if (!seen[k]) {
+        seen[k] = true;
+        all.push(req);
+      }
+    }
+    var all = [];
+    var seen = {};
+    var skipUrls = {};
+    (window.__diag_requests || []).forEach(function(req) {
+      if (req && req.url) skipUrls[req.url] = true;
+      pushUnique(all, seen, req);
+    });
+    try {
+      (performance.getEntriesByType('resource') || []).forEach(function(entry) {
+        var initiator = entry.initiatorType || 'performance';
+        if (initiator !== 'fetch' && initiator !== 'xmlhttprequest' && initiator !== 'beacon') return;
+        if (!shouldCapture(entry.name) || skipUrls[entry.name]) return;
+        var startedAt = Date.now();
+        if (performance.timeOrigin && entry.startTime != null) {
+          startedAt = Math.round(performance.timeOrigin + entry.startTime);
+        }
+        pushUnique(all, seen, {
+          method: 'GET',
+          url: entry.name,
+          status: entry.responseStatus || 0,
+          durationMs: Math.max(0, Math.round(entry.duration || 0)),
+          traceId: null,
+          timestamp: new Date(startedAt).toISOString(),
+          requestType: initiator,
+          responseSize: entry.transferSize || entry.encodedBodySize || entry.decodedBodySize || null
+        });
+      });
+    } catch(e) {}
+    var data = JSON.stringify({
+      pageUrl: window.__diag_page_url || location.href,
+      requests: all
+    });
+    var id = 'force-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    var chunkSize = 3500;
+    var total = Math.max(1, Math.ceil(data.length / chunkSize));
+    for (var i = 0; i < total; i++) {
+      sendProtocol('collect-chunk', {
+        id: id,
+        index: i,
+        total: total,
+        data: data.slice(i * chunkSize, (i + 1) * chunkSize)
+      });
+    }
+    sendProtocol('count', { value: all.length, t: Date.now() });
+    try {
+      document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
+    } catch(e) {}
+  } catch(e) {}
+})();
+"#;
+
 fn redirect_target_store() -> &'static Mutex<Option<String>> {
     REDIRECT_TARGET.get_or_init(|| Mutex::new(None))
 }
@@ -372,30 +672,32 @@ pub fn open_diagnostic_window(app: &AppHandle, url: &str) -> Result<(), String> 
     let target_host = parsed_url.host_str().map(|s| s.to_string());
     set_diagnostic_redirect_target(parsed_url.as_str().to_string());
 
-    let _window =
-        WebviewWindowBuilder::new(app, "diagnostic", diagnostic_window_url(&parsed_url))
-            .title(friendly_title)
-            .inner_size(1280.0, 900.0)
-            .center()
-            .initialization_script(DIAGNOSTIC_JS)
-            .devtools(true)
-            .on_navigation(|u| {
-                tracing::info!("诊断窗口 on_navigation -> {}", u);
-                true
-            })
-            .on_page_load(move |window, payload| {
-                let loaded = payload.url().clone();
-                tracing::info!("诊断窗口 on_page_load [{:?}] -> {}", payload.event(), loaded);
-                let on_target = loaded.host_str().map(|s| s.to_string()) == target_host;
-                if on_target {
-                    let _ = window.set_title(friendly_title);
-                } else {
-                    let _ = window
-                        .set_title(&format!("诊断浏览器【{}】[加载: {}]", NAV_TAG, loaded));
-                }
-            })
-            .build()
-            .map_err(|e| format!("创建诊断窗口失败: {}", e))?;
+    let _window = WebviewWindowBuilder::new(app, "diagnostic", diagnostic_window_url(&parsed_url))
+        .title(friendly_title)
+        .inner_size(1280.0, 900.0)
+        .center()
+        .initialization_script(DIAGNOSTIC_JS)
+        .devtools(true)
+        .on_navigation(|u| {
+            tracing::info!("诊断窗口 on_navigation -> {}", u);
+            true
+        })
+        .on_page_load(move |window, payload| {
+            let loaded = payload.url().clone();
+            tracing::info!(
+                "诊断窗口 on_page_load [{:?}] -> {}",
+                payload.event(),
+                loaded
+            );
+            let on_target = loaded.host_str().map(|s| s.to_string()) == target_host;
+            if on_target {
+                let _ = window.set_title(friendly_title);
+            } else {
+                let _ = window.set_title(&format!("诊断浏览器【{}】[加载: {}]", NAV_TAG, loaded));
+            }
+        })
+        .build()
+        .map_err(|e| format!("创建诊断窗口失败: {}", e))?;
 
     tracing::info!("诊断浏览器已打开: {}", url);
     Ok(())
@@ -423,23 +725,55 @@ mod tests {
 
         match super::diagnostic_window_url(&target) {
             tauri::WebviewUrl::External(actual) => assert_eq!(actual, target),
-            other => panic!("诊断窗口初始地址不应再停在 tauri.localhost 跳板页: {:?}", other),
+            other => panic!(
+                "诊断窗口初始地址不应再停在 tauri.localhost 跳板页: {:?}",
+                other
+            ),
         }
     }
 
     #[test]
-    fn diagnostic_script_does_not_send_custom_scheme_requests_from_external_page() {
+    fn diagnostic_script_does_not_send_custom_scheme_requests_with_xhr_or_fetch() {
         assert!(
-            !super::DIAGNOSTIC_JS.contains("diag://count"),
-            "外部医院页面不能用 XHR/fetch 请求 diag://count，WebView2 会按 CORS 拦截"
+            !super::DIAGNOSTIC_JS.contains("xhr.open('POST', 'diag://"),
+            "外部医院页面不能用 XHR 请求 diag://，WebView2 会按 CORS 拦截"
         );
         assert!(
-            !super::DIAGNOSTIC_JS.contains("diag://collect"),
-            "外部医院页面不能用 XHR/fetch 请求 diag://collect，WebView2 会按 CORS 拦截"
+            !super::DIAGNOSTIC_JS.contains("_origFetch.call(window, 'diag://"),
+            "外部医院页面不能用 fetch 请求 diag://，WebView2 会按 CORS 拦截"
         );
         assert!(super::DIAGNOSTIC_JS.contains("postMessage"));
         assert!(super::DIAGNOSTIC_JS.contains("[DIAG:"));
         assert!(super::DIAGNOSTIC_JS.contains("__resetDiagCapture"));
+    }
+
+    #[test]
+    fn diagnostic_script_has_navigation_protocol_and_performance_fallbacks() {
+        assert!(super::DIAGNOSTIC_JS.contains("document.createElement('iframe')"));
+        assert!(super::DIAGNOSTIC_JS.contains("iframe.src = 'diag://' + path"));
+        assert!(super::DIAGNOSTIC_JS.contains("_sendProtocol('count'"));
+        assert!(super::DIAGNOSTIC_JS.contains("_sendProtocol('collect-chunk'"));
+        assert!(super::DIAGNOSTIC_JS.contains("performance.getEntriesByType('resource')"));
+        assert!(super::DIAGNOSTIC_JS.contains("initiatorType"));
+    }
+
+    #[test]
+    fn captured_store_reassembles_chunked_payloads() {
+        let store = super::CapturedDataStore::default();
+
+        assert_eq!(
+            store
+                .store_chunk("abc".to_string(), 1, 2, "bar".to_string())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .store_chunk("abc".to_string(), 0, 2, "foo".to_string())
+                .unwrap(),
+            Some("foobar".to_string())
+        );
+        assert_eq!(store.data.lock().unwrap().as_deref(), Some("foobar"));
     }
 }
 
@@ -450,7 +784,7 @@ pub fn trigger_data_collection(app: &AppHandle) -> Result<(), String> {
         .ok_or("诊断窗口未打开，请先打开诊断浏览器")?;
 
     window
-        .eval("window.__sendDiagData()")
+        .eval("try { if (window.__sendDiagData) window.__sendDiagData(); } catch(e) { console.error('[Smart-Diag] send failed:', e); }")
         .map_err(|e| format!("触发数据采集失败: {}", e))?;
 
     Ok(())

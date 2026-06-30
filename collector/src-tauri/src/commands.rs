@@ -498,7 +498,7 @@ pub async fn open_diag_browser(
     count: State<'_, std::sync::Arc<std::sync::Mutex<usize>>>,
 ) -> Result<String, String> {
     // 清除上一次的捕获数据
-    *captured_store.data.lock().unwrap() = None;
+    captured_store.clear();
     *count.lock().unwrap() = 0;
 
     crate::webview_capture::open_diagnostic_window(&app, &url)?;
@@ -515,14 +515,15 @@ pub async fn collect_diag_data(
     use tauri::Manager;
 
     // 清除旧数据
-    *captured_store.data.lock().unwrap() = None;
+    captured_store.clear();
 
     let window = app
         .get_webview_window("diagnostic")
         .ok_or("诊断窗口未打开")?;
 
-    // 触发诊断窗口发送数据（Windows 外部页通过标题中转，旧路径仍可写入 captured_store）
+    // 触发诊断窗口发送数据（Windows 外部页通过导航式 diag:// 分片回传，旧路径仍可写入 captured_store）
     crate::webview_capture::trigger_data_collection(&app)?;
+    let _ = window.eval(crate::webview_capture::FORCE_DIAGNOSTIC_SNAPSHOT_JS);
 
     // 等待数据到达（最多等 3 秒）
     for _ in 0..30 {
@@ -537,8 +538,9 @@ pub async fn collect_diag_data(
     tracing::warn!("首次标题中转超时，重试触发诊断数据回传...");
 
     let _ = window.eval(
-        "try { window.__sendDiagData(); } catch(e) { console.error('sendDiagData failed:', e); }",
+        "try { if (window.__sendDiagData) window.__sendDiagData(); } catch(e) { console.error('sendDiagData failed:', e); }",
     );
+    let _ = window.eval(crate::webview_capture::FORCE_DIAGNOSTIC_SNAPSHOT_JS);
 
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -550,16 +552,16 @@ pub async fn collect_diag_data(
 
     // Fallback 2: 直接写标题，避开 custom scheme 的 CORS/协议限制。
     tracing::warn!("诊断脚本回传超时，尝试直接 title 中转...");
-    let _ = window.eval(r#"
+    let _ = window.eval(
+        r#"
         (function() {
             try {
-                var data = window.__getDiagData
-                    ? window.__getDiagData()
-                    : JSON.stringify({ pageUrl: location.href, requests: window.__diag_requests || [] });
-                document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
+                if (window.__sendDiagData) window.__sendDiagData();
             } catch(e) { console.error('[Smart-Diag] title fallback failed:', e); }
         })();
-    "#);
+    "#,
+    );
+    let _ = window.eval(crate::webview_capture::FORCE_DIAGNOSTIC_SNAPSHOT_JS);
 
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -583,6 +585,16 @@ pub async fn get_capture_count(
     if let Some(window) = app.get_webview_window("diagnostic") {
         if let Ok(title) = window.title() {
             if let Some(n) = extract_diag_count_from_title(&title) {
+                if n > 0 {
+                    *count.lock().unwrap() = n;
+                    return Ok(n);
+                }
+            }
+        }
+        let _ = window.eval(crate::webview_capture::FORCE_DIAGNOSTIC_COUNT_JS);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        if let Ok(title) = window.title() {
+            if let Some(n) = extract_diag_count_from_title(&title) {
                 *count.lock().unwrap() = n;
                 return Ok(n);
             }
@@ -601,12 +613,13 @@ pub fn reset_capture_data(
 ) -> String {
     use tauri::Manager;
     // 清除已缓存的捕获数据
-    *captured_store.data.lock().unwrap() = None;
+    captured_store.clear();
     // 重置计数
     *count.lock().unwrap() = 0;
     // 在诊断 WebView 中清空并（可选）重新导航到目标页面
     if let Some(window) = app.get_webview_window("diagnostic") {
-        let _ = window.eval(r#"
+        let _ = window.eval(
+            r#"
             (function() {
                 try {
                     if (window.__resetDiagCapture) {
@@ -616,6 +629,7 @@ pub fn reset_capture_data(
                         window.__diag_frame_requests = {};
                         window.__diag_frame_pages = {};
                         window.__diag_page_url = location.href;
+                        try { performance.clearResourceTimings(); } catch(e) {}
                         if (document && document.title) {
                             document.title = document.title
                                 .replace(/__DIAG_DATA_START__[\s\S]*?__DIAG_DATA_END__/g, '')
@@ -624,7 +638,8 @@ pub fn reset_capture_data(
                     }
                 } catch(e) {}
             })();
-        "#);
+        "#,
+        );
         // 如果提供了目标 URL，重新导航以捕获页面初始加载的 API 请求
         if let Some(ref url) = target_url {
             if !url.is_empty() {

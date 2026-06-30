@@ -20,7 +20,14 @@ use commands::*;
 use std::sync::Mutex;
 use webview_capture::CapturedDataStore;
 
-fn decode_diag_collect_payload(body: &[u8]) -> String {
+fn query_param(uri: &str, name: &str) -> Option<String> {
+    let query = uri.split_once('?')?.1.split('#').next().unwrap_or("");
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+fn decode_diag_collect_payload(uri: &str, body: &[u8]) -> String {
     let payload = String::from_utf8_lossy(body).into_owned();
     let trimmed = payload.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -33,7 +40,20 @@ fn decode_diag_collect_payload(body: &[u8]) -> String {
         return value.into_owned();
     }
 
-    payload
+    query_param(uri, "data").unwrap_or(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn decode_diag_collect_payload_reads_query_data_when_body_is_empty() {
+        let payload = super::decode_diag_collect_payload(
+            "diag://collect?data=%7B%22pageUrl%22%3A%22http%3A%2F%2Fhost%22%2C%22requests%22%3A%5B%5D%7D",
+            &[],
+        );
+
+        assert_eq!(payload, r#"{"pageUrl":"http://host","requests":[]}"#);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -103,8 +123,38 @@ pub fn run() {
                     .body(body.into_bytes())
                     .unwrap();
                 responder.respond(response);
+            } else if uri.contains("collect-chunk") {
+                let id = query_param(&uri, "id").unwrap_or_default();
+                let index = query_param(&uri, "index")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(usize::MAX);
+                let total = query_param(&uri, "total")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let data = query_param(&uri, "data").unwrap_or_default();
+
+                match captured_store_for_protocol.store_chunk(id, index, total, data) {
+                    Ok(Some(json)) => {
+                        tracing::info!("收到诊断分片数据并组装完成: {} bytes", json.len());
+                    }
+                    Ok(None) => {
+                        tracing::debug!("收到诊断数据分片: {}/{}", index.saturating_add(1), total);
+                    }
+                    Err(e) => {
+                        tracing::warn!("诊断数据分片无效: {}", e);
+                    }
+                }
+
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                    .header("Access-Control-Allow-Headers", "Content-Type")
+                    .body(b"ok".to_vec())
+                    .unwrap();
+                responder.respond(response);
             } else if uri.contains("collect") {
-                let data = decode_diag_collect_payload(&body);
+                let data = decode_diag_collect_payload(&uri, &body);
                 if !data.is_empty() {
                     tracing::info!("收到诊断数据: {} bytes", data.len());
                     *captured_store_for_protocol.data.lock().unwrap() = Some(data);
@@ -118,7 +168,13 @@ pub fn run() {
                     .unwrap();
                 responder.respond(response);
             } else if uri.contains("count") {
-                let count_str = String::from_utf8(body).unwrap_or_default();
+                let count_str = if body.is_empty() {
+                    query_param(&uri, "value")
+                        .or_else(|| query_param(&uri, "count"))
+                        .unwrap_or_default()
+                } else {
+                    String::from_utf8(body).unwrap_or_default()
+                };
                 if let Ok(count) = count_str.trim().parse::<usize>() {
                     tracing::info!("diag://count 更新计数: {}", count);
                     *count_for_protocol.lock().unwrap() = count;
