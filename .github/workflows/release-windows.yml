@@ -64,9 +64,22 @@ jobs:
 
       # 只打 NSIS（Windows 默认格式，GitHub Runner 已内置所需工具）
       # --bundles nsis 显式指定，避免尝试 msi 时因 WiX 缺失报错
+      # 打包时 Tauri 会下载 ~150MB 的 WebView2 离线运行时(offlineInstaller 模式),
+      # 从微软 fwlink 拉大文件偶发 `Peer disconnected`,故加重试(编译已缓存,重试很快)。
       - name: Build Collector (Windows NSIS)
         working-directory: collector
-        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
+        shell: pwsh
+        run: |
+          $max = 3
+          for ($i = 1; $i -le $max; $i++) {
+            Write-Host "=== 打包尝试 $i/$max ==="
+            cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Write-Host "打包失败 (exit $LASTEXITCODE),15s 后重试..."
+            Start-Sleep -Seconds 15
+          }
+          Write-Host "连续 $max 次打包均失败"
+          exit 1
 
       # 列出实际产物路径（方便排查）
       - name: List bundle output
@@ -126,7 +139,18 @@ jobs:
 
       - name: Build Analyzer (Windows NSIS)
         working-directory: analyzer
-        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
+        shell: pwsh
+        run: |
+          $max = 3
+          for ($i = 1; $i -le $max; $i++) {
+            Write-Host "=== 打包尝试 $i/$max ==="
+            cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Write-Host "打包失败 (exit $LASTEXITCODE),15s 后重试..."
+            Start-Sleep -Seconds 15
+          }
+          Write-Host "连续 $max 次打包均失败"
+          exit 1
 
       - name: List bundle output
         shell: pwsh
