@@ -1053,6 +1053,8 @@ async function resetCapture() {
   btn.disabled = true;
   btn.textContent = '重置中...';
   try {
+    // 重置：清空已记录请求与手势窗口，并重新导航回输入的目标页面（登录会话靠 cookie 保留），
+    // 回到干净的起点后，用户再点击出问题的功能开始记录。
     const targetUrl = document.getElementById('page-url').value.trim() || null;
     const msg = await invoke('reset_capture_data', { targetUrl });
     document.getElementById('req-tbody').innerHTML = '';
@@ -1110,6 +1112,15 @@ async function stopCapture() {
   }
 }
 
+// 兼容绝对/相对 URL 取 pathname（相对地址用任意 http base 解析即可拿到路径）
+function urlPathname(u) {
+  try {
+    return new URL(u, 'http://_').pathname;
+  } catch {
+    return String(u || '').split(/[?#]/)[0];
+  }
+}
+
 function filterCapturedDataByGateway(capturedData, gatewayPrefix) {
   const prefix = (gatewayPrefix || '').replace(/\/+$/, '');
   if (!prefix || prefix === '/') return capturedData;
@@ -1117,20 +1128,17 @@ function filterCapturedDataByGateway(capturedData, gatewayPrefix) {
   return {
     ...capturedData,
     requests: requests.filter(req => {
-      try {
-        const pathname = new URL(req.url).pathname;
-        return pathname === prefix || pathname.startsWith(prefix + '/');
-      } catch {
-        return false;
-      }
+      // 带 x-trace 的请求一律保留（数量不能少）；其余按网关前缀裁剪。
+      if (req.traceId && String(req.traceId).trim()) return true;
+      const pathname = urlPathname(req.url);
+      return pathname === prefix || pathname.startsWith(prefix + '/');
     }),
   };
 }
 
 function parseRequestUrl(url, gatewayPrefix) {
   try {
-    const urlObj = new URL(url);
-    const pathname = urlObj.pathname;
+    const pathname = urlPathname(url);
     if (pathname.startsWith(gatewayPrefix + '/')) {
       const rest = pathname.slice(gatewayPrefix.length + 1);
       const slash = rest.indexOf('/');
@@ -1247,7 +1255,7 @@ function showResultCard(result) {
     <div class="svc-row">
       <span class="svc-row-name">${escHtml(svc.name || svc || '-')}</span>
       <span class="svc-row-meta">
-        <span>${svc.requestCount ?? 0} 请求</span>
+        <span>${svc.traceIdCount ?? svc.requestCount ?? 0} 个 TraceID (${svc.totalRequests ?? svc.requestCount ?? 0} 请求)</span>
         ${svc.errorCount  > 0 ? `<span class="m-err">${svc.errorCount} 错误</span>` : ''}
         ${svc.logs?.length > 0 ? `<span>${svc.logs.length} 日志</span>` : ''}
         ${svc.slowSqls?.length > 0 ? `<span class="m-warn">${svc.slowSqls.length} 慢SQL</span>` : ''}

@@ -37,16 +37,7 @@ impl CapturedDataStore {
         if data.len() > MAX_CAPTURE_PAYLOAD_CHARS {
             return Err(format!("诊断数据过大: {} chars", data.len()));
         }
-        let incoming_count = captured_request_count(&data);
-        let mut stored = self.data.lock().unwrap();
-        let stored_count = stored
-            .as_deref()
-            .and_then(captured_request_count)
-            .unwrap_or(0);
-        if incoming_count == Some(0) && stored_count > 0 {
-            return Ok(());
-        }
-        *stored = Some(data);
+        *self.data.lock().unwrap() = Some(data);
         Ok(())
     }
 
@@ -102,591 +93,327 @@ impl CapturedDataStore {
     }
 }
 
-fn captured_request_count(data: &str) -> Option<usize> {
-    serde_json::from_str::<serde_json::Value>(data)
-        .ok()?
-        .get("requests")?
-        .as_array()
-        .map(|requests| requests.len())
-}
-
 /// 诊断 JS 注入脚本 —— 拦截 XHR 和 fetch API 请求（过滤静态资源）
+/// 策略：
+///   1) XMLHttpRequest.prototype 级别 hook —— 穿透任何 qiankun / micro-app 沙箱
+///   2) Object.defineProperty(window, 'fetch') getter —— 阻止沙箱覆盖 fetch
+///   3) Performance API 兜底 —— 补全 hook 未能覆盖的请求
 const DIAGNOSTIC_JS: &str = r#"
 (function() {
   'use strict';
 
   if (window.__SMART_DIAG_CAPTURE_INSTALLED__) {
-    console.log('[Smart-Diag] API 捕获脚本已存在，跳过重复注入');
+    console.log('[Smart-Diag] 已安装，跳过');
     return;
   }
   window.__SMART_DIAG_CAPTURE_INSTALLED__ = true;
-
-  const _origXHR = XMLHttpRequest;
-  const _origFetch = window.fetch;
+  window.__SMART_DIAG_ACTIVE = true;
 
   window.__diag_requests = window.__diag_requests || [];
   window.__diag_page_url = location.href;
-  var _isTop = false;
-  try { _isTop = window === window.top; } catch(e) { _isTop = false; }
-  var _frameId = 'frame-' + Date.now() + '-' + Math.random().toString(36).slice(2);
-  var _frameMessageType = 'smart-diag-frame-requests';
-  var _dataMessageType = 'smart-diag-data-ready';
-  var _resetMessageType = 'smart-diag-reset';
-  var _countEventName = 'smart-diag-capture-count';
-  var _dataEventName = 'smart-diag-capture-data';
+
   var _origTitle = document.title || '';
-  var _lastReportedCount = null;
-  var _USER_ACTION_WINDOW_MS = 15000;
-  var _CAPTURE_SESSION_TTL_MS = 30 * 60 * 1000;
-  var _captureStorageKey = 'smart-diag-capture-session';
+  var _lastReportedCount = -1;
 
-  function _newSessionId() {
-    return 'session-' + Date.now() + '-' + Math.random().toString(36).slice(2);
-  }
+  /* ── 捕获规则 ──────────────────────────────────────────────────────────────
+     只记录“带 x-trace（traceId）的请求” —— 业务请求经网关都会带回 X-Trace 响应头，
+     而静态资源 / 无关请求没有；用 traceId 是否存在作为唯一过滤条件，既能剔除噪声，
+     又保证“网络里有几条带 x-trace 的请求，就采到几条，一条不少”。不做手势窗口/时间窗
+     裁剪（否则会漏掉稍晚发出的业务请求）。 */
+  var MAX_REQUESTS = 5000;        /* 缓冲区硬上限，纯防御，正常复现远达不到 */
 
-  function _readStoredCaptureSession() {
+  /* ── traceId 提取 ─────────────────────────────────────────────────────── */
+  var _traceNames = [
+    'x-trace', 'x-trace-id', 'traceparent', 'trace-id',
+    'x-traceid', 'x-b3-traceid', 'x-request-id', 'request-id',
+    'x-correlation-id', 'correlation-id'
+  ];
+  function _findTraceId(headers) {
+    if (!headers) return null;
     try {
-      var raw = sessionStorage.getItem(_captureStorageKey);
-      if (!raw) return null;
-      var parsed = JSON.parse(raw);
-      if (!parsed || parsed.armed !== true) return null;
-      if (!parsed.sessionStartedAt || (Date.now() - parsed.sessionStartedAt) > _CAPTURE_SESSION_TTL_MS) {
-        sessionStorage.removeItem(_captureStorageKey);
-        return null;
+      if (typeof headers.get === 'function') {
+        for (var i = 0; i < _traceNames.length; i++) {
+          var v = headers.get(_traceNames[i]);
+          if (v) return v;
+        }
+      } else if (Array.isArray(headers)) {
+        for (var i = 0; i < headers.length; i++) {
+          if (Array.isArray(headers[i]) && headers[i].length >= 2) {
+            var k = headers[i][0], v = headers[i][1];
+            if (typeof k === 'string' && _traceNames.indexOf(k.toLowerCase()) !== -1) {
+              return v;
+            }
+          }
+        }
+      } else if (typeof headers === 'object') {
+        var keys = Object.keys(headers);
+        for (var j = 0; j < keys.length; j++) {
+          if (_traceNames.indexOf(keys[j].toLowerCase()) !== -1 && headers[keys[j]]) {
+            return headers[keys[j]];
+          }
+        }
       }
-      return parsed;
-    } catch(e) {
-      return null;
-    }
-  }
-
-  function _persistCaptureSession() {
-    try {
-      sessionStorage.setItem(_captureStorageKey, JSON.stringify({
-        armed: window.__diag_capture_armed === true,
-        sessionId: window.__diag_capture_session_id,
-        sessionStartedAt: window.__diag_capture_started_at
-      }));
     } catch(e) {}
+    return null;
   }
-
-  var _storedSession = _readStoredCaptureSession();
-  window.__diag_capture_session_id = window.__diag_capture_session_id || (_storedSession && _storedSession.sessionId) || _newSessionId();
-  window.__diag_capture_started_at = window.__diag_capture_started_at || (_storedSession && _storedSession.sessionStartedAt) || Date.now();
-  window.__diag_capture_started_perf = window.__diag_capture_started_perf == null
-    ? performance.now()
-    : window.__diag_capture_started_perf;
-  if (window.__diag_capture_armed !== true) {
-    window.__diag_capture_armed = false;
-    if (_storedSession && _storedSession.armed === true) {
-      window.__diag_capture_armed = !!(_storedSession && _storedSession.armed === true);
+  function _extractTraceId(url, initH, inputH, respH) {
+    var tid = _findTraceId(initH) || _findTraceId(inputH) || _findTraceId(respH);
+    if (!tid) {
+      try {
+        var u = new URL(url, location.href);
+        tid = u.searchParams.get('traceId') || u.searchParams.get('trace_id') || u.searchParams.get('x-trace');
+      } catch(e) {}
     }
+    if (!tid || typeof tid !== 'string') return null;
+    var t = tid.trim();
+    var parts = t.split('-');
+    if (parts.length >= 4 && parts[0] === '00') return parts[1];
+    return t;
   }
-  window.__diag_last_user_action_at = window.__diag_last_user_action_at || 0;
 
-  // ═══ 静态资源过滤 ═══
+  /* ── 静态资源过滤 ─────────────────────────────────────────────────────── */
   var _staticExts = /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i;
-  function _isStaticResource(url) {
-    try {
-      var u = new URL(url, location.href);
-      return _staticExts.test(u.pathname);
-    } catch(e) { return false; }
-  }
   function _shouldCapture(url) {
     if (!url || url.indexOf('diag://') === 0) return false;
-    if (_isStaticResource(url)) return false;
-    return true;
+    try { return !_staticExts.test(new URL(url, location.href).pathname); }
+    catch(e) { return false; }
+  }
+  /* 归一化为绝对 URL —— 拦截到的多为相对地址（/gateway/...），
+     下游网关过滤/去重/服务解析都按绝对 URL 处理（url::Url::parse 只认绝对地址），
+     不归一化会导致带 traceId 的相对请求被过滤掉，只剩 Performance 兜底的空 trace 条目。 */
+  function _absUrl(url) {
+    try { return new URL(url, location.href).href; } catch(e) { return url; }
   }
 
-  function _markUserAction() {
-    if (!window.__diag_capture_armed) return;
-    window.__diag_last_user_action_at = Date.now();
-  }
-
-  function _shouldRecordRequest(startedAtMs) {
-    if (!window.__diag_capture_armed) return false;
-    var actionAt = window.__diag_last_user_action_at || 0;
-    if (!actionAt) return false;
-    var startedAt = startedAtMs || Date.now();
-    if (startedAt < actionAt) return false;
-    return (startedAt - actionAt) <= _USER_ACTION_WINDOW_MS;
-  }
-
-  function _requestKey(req) {
-    return [
-      req.method || '',
-      req.url || '',
-      req.status == null ? '' : String(req.status),
-      req.timestamp || '',
-      req.requestType || ''
-    ].join('|');
-  }
-
-  function _belongsToCurrentSession(req) {
-    if (!req) return false;
-    if (req.__diag_session_id && req.__diag_session_id !== window.__diag_capture_session_id) return false;
-    if (req.capturedAtMs && req.capturedAtMs < window.__diag_capture_started_at) return false;
-    return true;
-  }
-
-  function _emitToRust(eventName, payload) {
+  /* ── Tauri 事件回传 ───────────────────────────────────────────────────── */
+  function _emitToRust(name, payload) {
     try {
-      var eventApi = window.__TAURI__ && window.__TAURI__.event;
-      if (eventApi && typeof eventApi.emit === 'function') {
-        eventApi.emit(eventName, payload).catch(function(e) {
-          try { console.warn('[Smart-Diag] 事件回传失败:', e); } catch(_) {}
-        });
+      var api = window.__TAURI__ && window.__TAURI__.event;
+      if (api && typeof api.emit === 'function') {
+        api.emit(name, payload).catch(function(){});
         return true;
       }
     } catch(e) {}
     return false;
   }
-
-  function _sendCountToRust(count) {
-    if (_lastReportedCount === count) return;
+  function _notifyCount() {
+    var count = window.__diag_requests.length;
+    if (count === _lastReportedCount) return;
     _lastReportedCount = count;
-    _emitToRust(_countEventName, {
-      value: count,
-      pageUrl: window.__diag_page_url || location.href,
-      t: Date.now()
+    _emitToRust('smart-diag-capture-count', {
+      value: count, pageUrl: window.__diag_page_url || location.href, t: Date.now()
     });
-  }
-
-  function _sendDataToRust(data) {
-    _emitToRust(_dataEventName, {
-      data: data,
-      pageUrl: window.__diag_page_url || location.href,
-      t: Date.now()
-    });
-  }
-
-  function _performanceRequests(skipUrls) {
-    var requests = [];
-    if (!window.__diag_capture_armed) return requests;
-    try {
-      var entries = performance.getEntriesByType('resource') || [];
-      entries.forEach(function(entry) {
-        var initiator = entry.initiatorType || 'performance';
-        if (initiator !== 'fetch' && initiator !== 'xmlhttprequest' && initiator !== 'beacon') return;
-        if (entry.startTime < window.__diag_capture_started_perf) return;
-        if (!_shouldCapture(entry.name)) return;
-        if (skipUrls && skipUrls[entry.name]) return;
-        var startedAt = Date.now();
-        if (performance.timeOrigin && entry.startTime != null) {
-          startedAt = Math.round(performance.timeOrigin + entry.startTime);
-        }
-        if (startedAt < window.__diag_capture_started_at) return;
-        if (!_shouldRecordRequest(startedAt)) return;
-        requests.push({
-          method: 'GET',
-          url: entry.name,
-          status: entry.responseStatus || 0,
-          durationMs: Math.max(0, Math.round(entry.duration || 0)),
-          traceId: null,
-          timestamp: new Date(startedAt).toISOString(),
-          requestType: initiator,
-          responseSize: entry.transferSize || entry.encodedBodySize || entry.decodedBodySize || null,
-          capturedAtMs: startedAt,
-          __diag_session_id: window.__diag_capture_session_id
-        });
-      });
-    } catch(e) {}
-    return requests;
-  }
-
-  function _localRequestsWithPerformance() {
-    if (!window.__diag_capture_armed) return [];
-    var seen = {};
-    var skipUrls = {};
-    var all = [];
-    (window.__diag_requests || []).forEach(function(req) {
-      if (!_belongsToCurrentSession(req)) return;
-      var key = _requestKey(req);
-      if (req && req.url) skipUrls[req.url] = true;
-      if (!seen[key]) {
-        seen[key] = true;
-        all.push(req);
-      }
-    });
-    _performanceRequests(skipUrls).forEach(function(req) {
-      var key = _requestKey(req);
-      if (!seen[key]) {
-        seen[key] = true;
-        all.push(req);
-      }
-    });
-    return all;
-  }
-
-  function _ensureTopStores() {
-    if (!_isTop) return;
-    window.__diag_frame_requests = window.__diag_frame_requests || {};
-    window.__diag_frame_pages = window.__diag_frame_pages || {};
-  }
-
-  function _mergeFramePayload(payload) {
-    if (!_isTop || !payload) return;
-    if (!window.__diag_capture_armed) return;
-    if (payload.sessionStartedAt && payload.sessionStartedAt < window.__diag_capture_started_at) return;
-    if (
-      payload.sessionId &&
-      payload.sessionId !== window.__diag_capture_session_id &&
-      (!payload.sessionStartedAt || payload.sessionStartedAt < window.__diag_capture_started_at)
-    ) return;
-    _ensureTopStores();
-    var frameId = payload.frameId || 'unknown';
-    window.__diag_frame_requests[frameId] = Array.isArray(payload.requests) ? payload.requests : [];
-    if (payload.pageUrl) {
-      window.__diag_frame_pages[frameId] = payload.pageUrl;
-    }
-  }
-
-  function _allRequests() {
-    if (!window.__diag_capture_armed) return [];
-    if (!_isTop) return _localRequestsWithPerformance();
-    _ensureTopStores();
-    _mergeFramePayload({
-      frameId: _frameId,
-      pageUrl: window.__diag_page_url || location.href,
-      requests: _localRequestsWithPerformance()
-    });
-
-    var seen = {};
-    var skipUrls = {};
-    var all = [];
-    Object.keys(window.__diag_frame_requests).forEach(function(frameId) {
-      (window.__diag_frame_requests[frameId] || []).forEach(function(req) {
-        var key = _requestKey(req);
-        if (req && req.url) skipUrls[req.url] = true;
-        if (!seen[key]) {
-          seen[key] = true;
-          all.push(req);
-        }
-      });
-    });
-    _performanceRequests(skipUrls).forEach(function(req) {
-      var key = _requestKey(req);
-      if (!seen[key]) {
-        seen[key] = true;
-        all.push(req);
-      }
-    });
-    return all;
-  }
-
-  function _setTopCountTitle(count) {
-    if (!_isTop) return;
     try {
       var base = (_origTitle || document.title || '').replace(/^\[DIAG:\d+\]\s*/, '');
       document.title = '[DIAG:' + count + '] ' + base;
-      _sendCountToRust(count);
     } catch(e) {}
   }
-
-  function _publishCaptureState() {
-    if (!window.__diag_capture_armed) {
-      if (_isTop) _setTopCountTitle(0);
-      return;
-    }
-    var payload = {
-      type: _frameMessageType,
-      frameId: _frameId,
-      pageUrl: window.__diag_page_url || location.href,
-      requests: (window.__diag_requests || []).filter(_belongsToCurrentSession),
-      sessionId: window.__diag_capture_session_id,
-      sessionStartedAt: window.__diag_capture_started_at
-    };
-
-    if (_isTop) {
-      _mergeFramePayload(payload);
-      _setTopCountTitle(_allRequests().length);
-      return;
-    }
-
-    try {
-      window.top.postMessage(payload, '*');
-    } catch(e) {}
+  function _addRequest(req) {
+    if (!window.__SMART_DIAG_ACTIVE) return;
+    /* 只记录带 x-trace 的请求；无 traceId 的（静态资源、无关请求）直接丢弃。 */
+    if (!req || !req.traceId) return;
+    if (window.__diag_requests.length >= MAX_REQUESTS) return;
+    window.__diag_requests.push(req);
+    _notifyCount();
   }
 
-  function _resetLocalCapture(session) {
-    session = session || {};
-    window.__diag_capture_session_id = session.sessionId || _newSessionId();
-    window.__diag_capture_started_at = session.sessionStartedAt || Date.now();
-    window.__diag_capture_started_perf = performance.now();
-    window.__diag_capture_armed = true;
-    window.__diag_last_user_action_at = 0;
-    _persistCaptureSession();
-    _lastReportedCount = null;
-    window.__diag_requests = [];
-    window.__diag_page_url = location.href;
-    try { performance.clearResourceTimings(); } catch(e) {}
-    if (_isTop) {
-      window.__diag_frame_requests = {};
-      window.__diag_frame_pages = {};
-      _setTopCountTitle(0);
-    }
-  }
+  /* ═══════════════════════════════════════════════════════════════════════
+     1. Hook fetch —— Object.defineProperty getter
+     qiankun ProxySandbox 的 get trap fallthrough 到 rawWindow。
+     defineProperty getter 保证 any 时刻读取 window.fetch 都返回 hook。
+     ═══════════════════════════════════════════════════════════════════════ */
+  var _realFetch = null;
+  try { _realFetch = window.fetch.bind(window); } catch(e) {}
 
-  function _broadcastReset() {
-    if (!_isTop) return;
-    for (var i = 0; i < window.frames.length; i++) {
-      try {
-        window.frames[i].postMessage({
-          type: _resetMessageType,
-          sessionId: window.__diag_capture_session_id,
-          sessionStartedAt: window.__diag_capture_started_at
-        }, '*');
-      } catch(e) {}
-    }
-  }
-
-  window.__resetDiagCapture = function() {
-    _resetLocalCapture();
-    if (_isTop) {
-      _broadcastReset();
-    } else {
-      _publishCaptureState();
-    }
-  };
-
-  try {
-    window.addEventListener('message', function(event) {
-      var data = event && event.data;
-      if (!data || typeof data !== 'object') return;
-      if (data.type === _resetMessageType) {
-        _resetLocalCapture(data);
-        return;
+  if (_realFetch) {
+    var _hookedFetch = async function diagFetch(input, init) {
+      var start = performance.now(), startMs = Date.now();
+      var url  = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
+      url = _absUrl(url);
+      var meth = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+      var resp;
+      try { resp = await _realFetch(input, init); } catch(err) {
+        if (window.__SMART_DIAG_ACTIVE && _shouldCapture(url)) {
+          _addRequest({ method: meth, url: url, status: 0,
+            durationMs: Math.round(performance.now() - start),
+            traceId: _extractTraceId(url, init && init.headers, input && input.headers, null),
+            timestamp: new Date(startMs).toISOString(), requestType: 'fetch', responseSize: null });
+        }
+        throw err;
       }
-      if (!_isTop) return;
-      if (data.type === _frameMessageType) {
-        _mergeFramePayload(data);
-        _setTopCountTitle(_allRequests().length);
-      } else if (data.type === _dataMessageType && data.data) {
-        try {
-          var parsed = JSON.parse(data.data);
-          _mergeFramePayload({
-            frameId: data.frameId,
-            pageUrl: parsed.pageUrl,
-            requests: parsed.requests,
-            sessionId: data.sessionId,
-            sessionStartedAt: data.sessionStartedAt
-          });
-        } catch(e) {}
-        window.__sendDiagData();
-      }
-    });
-  } catch(e) {}
-
-  try {
-    ['pointerdown', 'click', 'dblclick', 'keydown', 'change', 'submit'].forEach(function(name) {
-      window.addEventListener(name, _markUserAction, true);
-    });
-  } catch(e) {}
-
-  // ═══ 拦截 fetch ═══
-  window.fetch = async function(input, init) {
-    const start = performance.now();
-    const requestStartedAtMs = Date.now();
-    var shouldRecordRequest = _shouldRecordRequest(requestStartedAtMs);
-    let url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
-    let method = (init && init.method) || (input instanceof Request ? input.method : 'GET');
-
-    try {
-      const resp = await _origFetch.call(window, input, init);
-      if (shouldRecordRequest && _shouldCapture(url)) {
-        const duration = Math.round(performance.now() - start);
-        let size = null;
-        const cl = resp.headers.get('content-length');
-        if (cl) size = parseInt(cl, 10);
-
-        window.__diag_requests.push({
-          method: method.toUpperCase(),
-          url: url,
-          status: resp.status,
-          durationMs: duration,
-          traceId: resp.headers.get('x-trace') || resp.headers.get('x-trace-id') || resp.headers.get('traceparent') || null,
-          timestamp: new Date(requestStartedAtMs).toISOString(),
-          requestType: 'fetch',
-          responseSize: size,
-          capturedAtMs: requestStartedAtMs,
-          __diag_session_id: window.__diag_capture_session_id
-        });
-        _notifyCount();
+      if (window.__SMART_DIAG_ACTIVE && _shouldCapture(url)) {
+        var tid = _extractTraceId(url, init && init.headers, input && input.headers, resp.headers);
+        console.log('[Smart-Diag] fetch:', meth, url, resp.status, 'tid:', tid);
+        _addRequest({ method: meth, url: url, status: resp.status,
+          durationMs: Math.round(performance.now() - start),
+          traceId: tid, timestamp: new Date(startMs).toISOString(),
+          requestType: 'fetch', responseSize: null });
       }
       return resp;
-    } catch (err) {
-      if (shouldRecordRequest && _shouldCapture(url)) {
-        const duration = Math.round(performance.now() - start);
-        window.__diag_requests.push({
-          method: method.toUpperCase(),
-          url: url,
-          status: 0,
-          durationMs: duration,
-          traceId: null,
-          timestamp: new Date(requestStartedAtMs).toISOString(),
-          requestType: 'fetch',
-          responseSize: null,
-          capturedAtMs: requestStartedAtMs,
-          __diag_session_id: window.__diag_capture_session_id
-        });
-        _notifyCount();
+    };
+    try {
+      Object.defineProperty(window, 'fetch', {
+        get: function() { return _hookedFetch; },
+        set: function(fn) {
+          if (fn && fn !== _hookedFetch) {
+            _realFetch = typeof fn.bind === 'function' ? fn.bind(window) : fn;
+          }
+        },
+        configurable: true, enumerable: true
+      });
+      console.log('[Smart-Diag] fetch hook OK (defineProperty)');
+    } catch(e) {
+      window.fetch = _hookedFetch;
+      console.log('[Smart-Diag] fetch hook OK (assign)');
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     2. Hook XMLHttpRequest.prototype —— 全局原型，穿透所有沙箱
+     ═══════════════════════════════════════════════════════════════════════ */
+  (function() {
+    var proto = XMLHttpRequest.prototype;
+    var _oOpen = proto.open, _oSend = proto.send, _oSetHdr = proto.setRequestHeader;
+
+    proto.open = function(method, url) {
+      this.__diagInfo = { method: (method||'GET').toUpperCase(), url: url||'', start:0, startMs:0, reqH:{} };
+      return _oOpen.apply(this, arguments);
+    };
+    proto.setRequestHeader = function(name, value) {
+      try { if (this.__diagInfo && name) this.__diagInfo.reqH[name.toLowerCase()] = value; } catch(e){}
+      return _oSetHdr.apply(this, arguments);
+    };
+    proto.send = function() {
+      if (this.__diagInfo) {
+        this.__diagInfo.start = performance.now();
+        this.__diagInfo.startMs = Date.now();
+        var self = this;
+        this.addEventListener('loadend', function onEnd() {
+          var info = self.__diagInfo;
+          if (!info || !window.__SMART_DIAG_ACTIVE || !_shouldCapture(info.url)) return;
+          var respH = { get: function(n) { try { return self.getResponseHeader(n); } catch(e) { return null; } } };
+          var tid = _extractTraceId(info.url, info.reqH, null, respH);
+          console.log('[Smart-Diag] XHR:', info.method, info.url, self.status, 'tid:', tid);
+          _addRequest({ method: info.method, url: _absUrl(info.url), status: self.status,
+            durationMs: Math.round(performance.now() - info.start),
+            traceId: tid, timestamp: new Date(info.startMs).toISOString(),
+            requestType: 'xhr', responseSize: null });
+        }, { once: true });
       }
-      throw err;
-    }
-  };
+      return _oSend.apply(this, arguments);
+    };
+    console.log('[Smart-Diag] XHR prototype hook OK');
+  })();
 
-  // ═══ 拦截 XMLHttpRequest ═══
-  var _origOpen = _origXHR.prototype.open;
-  var _origSend = _origXHR.prototype.send;
-
-  XMLHttpRequest.prototype.open = function(method, url) {
-    this.__diag = { method: method, url: url, start: 0 };
-    _origOpen.apply(this, arguments);
-  };
-
-  XMLHttpRequest.prototype.send = function() {
-    if (this.__diag) {
-      this.__diag.start = performance.now();
-      this.__diag.requestStartedAtMs = Date.now();
-      this.__diag.shouldRecordRequest = _shouldRecordRequest(this.__diag.requestStartedAtMs);
-      this.addEventListener('loadend', function() {
-        var url = this.__diag.url;
-        if (!this.__diag.shouldRecordRequest) return;
-        if (!_shouldCapture(url)) return;
-
-        var duration = Math.round(performance.now() - this.__diag.start);
-        var traceId = null;
-        var size = null;
-        try {
-          traceId = this.getResponseHeader('x-trace') || this.getResponseHeader('x-trace-id') || this.getResponseHeader('traceparent');
-          var cl = this.getResponseHeader('content-length');
-          if (cl) size = parseInt(cl, 10);
-        } catch(e) {}
-
-        if (!size && this.responseText) {
-          size = this.responseText.length;
-        }
-
-        window.__diag_requests.push({
-          method: this.__diag.method.toUpperCase(),
-          url: url,
-          status: this.status,
-          durationMs: duration,
-          traceId: traceId,
-          timestamp: new Date(this.__diag.requestStartedAtMs).toISOString(),
-          requestType: 'xhr',
-          responseSize: size,
-          capturedAtMs: this.__diag.requestStartedAtMs,
-          __diag_session_id: window.__diag_capture_session_id
-        });
-        _notifyCount();
-      });
-    }
-    _origSend.apply(this, arguments);
-  };
-
-  // ═══ 获取采集数据 ═══
+  /* ── 数据导出接口 ─────────────────────────────────────────────────────────
+     只导出 hook 捕获到的带 x-trace 的请求；不再用 Performance API 兜底
+     （Performance 条目拿不到响应头 → 没有 traceId，只会引入空 trace 噪声）。
+     去重按 method+url+traceId，保证同一 traceId 的同一接口只留一条、又不误删不同 trace。 */
   window.__getDiagData = function() {
-    if (!window.__diag_capture_armed) {
-      return JSON.stringify({
-        pageUrl: window.__diag_page_url || location.href,
-        requests: []
-      });
-    }
-    return JSON.stringify({
-      pageUrl: window.__diag_page_url || location.href,
-      requests: _isTop ? _allRequests() : _localRequestsWithPerformance()
+    var seen = {}, result = [];
+    (window.__diag_requests || []).forEach(function(req) {
+      var k = [req.method, req.url, req.traceId, req.timestamp].join('|');
+      if (!seen[k]) { seen[k] = true; result.push(req); }
     });
+    return JSON.stringify({ pageUrl: window.__diag_page_url || location.href, requests: result });
   };
 
-  window.__getDiagCount = function() {
-    if (!window.__diag_capture_armed) return 0;
-    return (_isTop ? _allRequests() : _localRequestsWithPerformance()).length;
-  };
-
-  // ═══ 发送采集数据到 Rust 后端 ═══
   window.__sendDiagData = function() {
     var data = window.__getDiagData();
     try {
-      if (_isTop) {
-        document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
-        _sendDataToRust(data);
-      } else {
-        window.top.postMessage({
-          type: _dataMessageType,
-          frameId: _frameId,
-          data: data,
-          sessionId: window.__diag_capture_session_id,
-          sessionStartedAt: window.__diag_capture_started_at
-        }, '*');
+      document.title = '__DIAG_DATA_START__' + data + '__DIAG_DATA_END__';
+      var eventApi = window.__TAURI__ && window.__TAURI__.event;
+      if (eventApi && typeof eventApi.emit === 'function') {
+        eventApi.emit('smart-diag-capture-data', {
+          data: data, pageUrl: window.__diag_page_url || location.href, t: Date.now()
+        }).catch(function(){});
       }
     } catch(e) {}
-  };
-
-  // ═══ 通知计数更新 ═══
-  function _notifyCount() {
-    _publishCaptureState();
-  }
-
-  // ═══ 页面导航时更新 URL ═══
-  var _pushState = history.pushState;
-  var _replaceState = history.replaceState;
-  history.pushState = function() {
-    var ret = _pushState.apply(this, arguments);
-    window.__diag_page_url = location.href;
-    _publishCaptureState();
-    return ret;
-  };
-  history.replaceState = function() {
-    var ret = _replaceState.apply(this, arguments);
-    window.__diag_page_url = location.href;
-    _publishCaptureState();
-    return ret;
-  };
-  window.addEventListener('popstate', function() {
-    window.__diag_page_url = location.href;
-    _publishCaptureState();
-  });
-
-  // ═══ 周期性刷新顶层计数 ═══
-  // frame 内捕获的数据通过 postMessage 汇总到顶层页，顶层页再通过 Tauri event IPC
-  // 回传给 Rust。标题栏只保留给人工观察，不作为 Windows 的可靠数据通道。
-  setInterval(function() {
     try {
-      if (_isTop) {
-        var count = _allRequests().length;
-        if (count > 0) _setTopCountTitle(count);
-      } else if (window.__diag_requests && window.__diag_requests.length > 0) {
-        _publishCaptureState();
+      if (window !== window.top) {
+        window.top.postMessage({ type: 'smart-diag-data', data: data }, '*');
       }
     } catch(e) {}
-  }, 1000);
+  };
 
-  console.log('[Smart-Diag] API 捕获脚本已注入（XHR + fetch，过滤静态资源，Tauri event 回传）');
+  window.__resetDiagCapture = function() {
+    window.__diag_requests = [];
+    window.__diag_page_url = location.href;
+    _lastReportedCount = -1;
+    try { performance.clearResourceTimings(); } catch(e) {}
+    _notifyCount();
+  };
+
+  /* ── URL 变化追踪（仅更新当前页面 URL，不影响捕获）───────────────────────── */
+  (function() {
+    var _ps = history.pushState, _rs = history.replaceState;
+    history.pushState = function() { var r=_ps.apply(this,arguments); window.__diag_page_url=location.href; return r; };
+    history.replaceState = function() { var r=_rs.apply(this,arguments); window.__diag_page_url=location.href; return r; };
+    window.addEventListener('popstate', function() { window.__diag_page_url = location.href; });
+  })();
+
+  /* ── 周期计数 ─────────────────────────────────────────────────────────── */
+  setInterval(function() { try { _notifyCount(); } catch(e){} }, 1000);
+
+  console.log('[Smart-Diag] 注入完成 (XHR prototype + fetch defineProperty)');
 })();
 "#;
+
+
+
 
 pub(crate) const FORCE_DIAGNOSTIC_COUNT_JS: &str = r#"
 (function() {
   try {
-    function sendCount(count) {
+    var count = 0;
+    if (typeof window.__getDiagData === 'function') {
       try {
-        var eventApi = window.__TAURI__ && window.__TAURI__.event;
-        if (eventApi && typeof eventApi.emit === 'function') {
-          eventApi.emit('smart-diag-capture-count', {
-            value: count,
-            pageUrl: window.__diag_page_url || location.href,
-            t: Date.now()
-          }).catch(function(e) {
-            try { console.warn('[Smart-Diag] 计数事件回传失败:', e); } catch(_) {}
+        var parsed = JSON.parse(window.__getDiagData());
+        count = (parsed && parsed.requests && parsed.requests.length) || 0;
+      } catch(e) {}
+    } else {
+      function isStatic(url) {
+        try {
+          var u = new URL(url, location.href);
+          return /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i.test(u.pathname);
+        } catch(e) { return false; }
+      }
+      function shouldCapture(url) {
+        return !!url && url.indexOf('diag://') !== 0 && !isStatic(url);
+      }
+      function perfCount() {
+        var urls = {};
+        (window.__diag_requests || []).forEach(function(req) {
+          if (req && req.url) urls[req.url] = true;
+        });
+        try {
+          (performance.getEntriesByType('resource') || []).forEach(function(entry) {
+            var t = entry.initiatorType || '';
+            if ((t === 'fetch' || t === 'xmlhttprequest' || t === 'beacon') && shouldCapture(entry.name)) {
+              urls[entry.name] = true;
+            }
           });
-        }
-      } catch(e) {}
-      try {
-        document.title = '[DIAG:' + count + '] ' + String(document.title || '').replace(/^\[DIAG:\d+\]\s*/, '');
-      } catch(e) {}
+        } catch(e) {}
+        return Object.keys(urls).length;
+      }
+      count = perfCount();
     }
-    sendCount(window.__getDiagCount ? window.__getDiagCount() : ((window.__diag_requests || []).length));
+    
+    try {
+      var eventApi = window.__TAURI__ && window.__TAURI__.event;
+      if (eventApi && typeof eventApi.emit === 'function') {
+        eventApi.emit('smart-diag-capture-count', {
+          value: count,
+          pageUrl: window.__diag_page_url || location.href,
+          t: Date.now()
+        }).catch(function(e) {
+          try { console.warn('[Smart-Diag] 计数事件回传失败:', e); } catch(_) {}
+        });
+      }
+    } catch(e) {}
+    try {
+      document.title = '[DIAG:' + count + '] ' + String(document.title || '').replace(/^\[DIAG:\d+\]\s*/, '');
+    } catch(e) {}
   } catch(e) {}
 })();
 "#;
@@ -694,15 +421,67 @@ pub(crate) const FORCE_DIAGNOSTIC_COUNT_JS: &str = r#"
 pub(crate) const FORCE_DIAGNOSTIC_SNAPSHOT_JS: &str = r#"
 (function() {
   try {
-    var data = window.__getDiagData
-      ? window.__getDiagData()
-      : JSON.stringify({
-          pageUrl: window.__diag_page_url || location.href,
-          requests: window.__diag_requests || []
+    var data = null;
+    if (typeof window.__getDiagData === 'function') {
+      try {
+        data = window.__getDiagData();
+      } catch(e) {}
+    }
+    
+    if (!data) {
+      function isStatic(url) {
+        try {
+          var u = new URL(url, location.href);
+          return /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|html|htm)(\?|$)/i.test(u.pathname);
+        } catch(e) { return false; }
+      }
+      function shouldCapture(url) {
+        return !!url && url.indexOf('diag://') !== 0 && !isStatic(url);
+      }
+      function key(req) {
+        return [req.method || '', req.url || '', req.status == null ? '' : String(req.status), req.timestamp || '', req.requestType || ''].join('|');
+      }
+      function pushUnique(all, seen, req) {
+        var k = key(req);
+        if (!seen[k]) {
+          seen[k] = true;
+          all.push(req);
+        }
+      }
+      var all = [];
+      var seen = {};
+      var skipUrls = {};
+      (window.__diag_requests || []).forEach(function(req) {
+        if (req && req.url) skipUrls[req.url] = true;
+        pushUnique(all, seen, req);
+      });
+      try {
+        (performance.getEntriesByType('resource') || []).forEach(function(entry) {
+          var initiator = entry.initiatorType || 'performance';
+          if (initiator !== 'fetch' && initiator !== 'xmlhttprequest' && initiator !== 'beacon') return;
+          if (!shouldCapture(entry.name) || skipUrls[entry.name]) return;
+          var startedAt = Date.now();
+          if (performance.timeOrigin && entry.startTime != null) {
+            startedAt = Math.round(performance.timeOrigin + entry.startTime);
+          }
+          pushUnique(all, seen, {
+            method: 'GET',
+            url: entry.name,
+            status: entry.responseStatus || 0,
+            durationMs: Math.max(0, Math.round(entry.duration || 0)),
+            traceId: null,
+            timestamp: new Date(startedAt).toISOString(),
+            requestType: initiator,
+            responseSize: entry.transferSize || entry.encodedBodySize || entry.decodedBodySize || null
+          });
         });
-    var parsed = { requests: [] };
-    try { parsed = JSON.parse(data); } catch(e) {}
-    var count = Array.isArray(parsed.requests) ? parsed.requests.length : 0;
+      } catch(e) {}
+      data = JSON.stringify({
+        pageUrl: window.__diag_page_url || location.href,
+        requests: all
+      });
+    }
+
     try {
       var eventApi = window.__TAURI__ && window.__TAURI__.event;
       if (eventApi && typeof eventApi.emit === 'function') {
@@ -713,8 +492,11 @@ pub(crate) const FORCE_DIAGNOSTIC_SNAPSHOT_JS: &str = r#"
         }).catch(function(e) {
           try { console.warn('[Smart-Diag] 快照事件回传失败:', e); } catch(_) {}
         });
+        
+        var parsed = JSON.parse(data);
+        var reqCount = (parsed && parsed.requests && parsed.requests.length) || 0;
         eventApi.emit('smart-diag-capture-count', {
-          value: count,
+          value: reqCount,
           pageUrl: window.__diag_page_url || location.href,
           t: Date.now()
         }).catch(function(e) {
@@ -862,82 +644,26 @@ mod tests {
         }
         assert!(super::DIAGNOSTIC_JS.contains("smart-diag-capture-count"));
         assert!(super::DIAGNOSTIC_JS.contains("smart-diag-capture-data"));
-        assert!(super::DIAGNOSTIC_JS.contains("performance.getEntriesByType('resource')"));
-        assert!(super::DIAGNOSTIC_JS.contains("initiatorType"));
     }
 
     #[test]
-    fn diagnostic_scripts_scope_counts_and_snapshots_to_active_capture_session() {
-        assert!(super::DIAGNOSTIC_JS.contains("__diag_capture_session_id"));
-        assert!(super::DIAGNOSTIC_JS.contains("__diag_capture_started_at"));
-        assert!(super::DIAGNOSTIC_JS.contains("__diag_capture_started_perf"));
-        assert!(super::DIAGNOSTIC_JS.contains("req.__diag_session_id"));
-        assert!(super::DIAGNOSTIC_JS.contains("payload.sessionId"));
-        assert!(super::DIAGNOSTIC_JS.contains("payload.sessionStartedAt"));
+    fn diagnostic_script_only_captures_requests_with_trace_id() {
+        let js = super::DIAGNOSTIC_JS;
+        // 捕获规则：只记录带 x-trace（traceId）的请求 —— _addRequest 必须在无 traceId 时直接返回。
         assert!(
-            super::DIAGNOSTIC_JS.contains("entry.startTime < window.__diag_capture_started_perf")
+            js.contains("if (!req || !req.traceId) return;"),
+            "_addRequest 必须只记录带 traceId 的请求"
         );
-        assert!(super::DIAGNOSTIC_JS.contains("window.__getDiagCount"));
+        // 不能再用手势窗口裁剪（会漏掉稍晚发出的业务请求，导致“网络里 9 条报告里只有 5 条”）。
         assert!(
-            super::FORCE_DIAGNOSTIC_COUNT_JS.contains("window.__getDiagCount"),
-            "轮询计数应读取注入脚本的会话计数，不能重新扫描整个 performance timeline"
+            !js.contains("_withinGestureWindow") && !js.contains("__diag_gesture_until"),
+            "不应再有手势窗口门控，否则会漏掉带 x-trace 的请求"
         );
+        // 不能再用 Performance API 兜底（Performance 条目拿不到响应头 → traceId 恒为 null，只会引入空 trace 噪声）。
         assert!(
-            super::FORCE_DIAGNOSTIC_SNAPSHOT_JS.contains("window.__getDiagData"),
-            "强制快照应复用注入脚本聚合后的 frame 数据，不能用顶层空快照覆盖完整数据"
+            !js.contains("getEntriesByType('resource')"),
+            "不应再用 Performance 兜底，否则会引入没有 traceId 的空条目"
         );
-    }
-
-    #[test]
-    fn diagnostic_script_starts_disarmed_until_user_resets_capture() {
-        assert!(super::DIAGNOSTIC_JS.contains("window.__diag_capture_armed = false"));
-        assert!(super::DIAGNOSTIC_JS.contains("window.__diag_capture_armed = true"));
-        assert!(
-            super::DIAGNOSTIC_JS.contains("if (!window.__diag_capture_armed) return 0"),
-            "诊断浏览器刚打开、登录前不能累计系统初始化或轮询请求"
-        );
-        assert!(
-            super::DIAGNOSTIC_JS.contains("if (!window.__diag_capture_armed) return []"),
-            "未点击重置采集前，强制快照也必须返回空请求"
-        );
-    }
-
-    #[test]
-    fn diagnostic_script_records_only_requests_triggered_by_user_actions() {
-        assert!(super::DIAGNOSTIC_JS.contains("_USER_ACTION_WINDOW_MS"));
-        assert!(super::DIAGNOSTIC_JS.contains("__diag_last_user_action_at"));
-        assert!(super::DIAGNOSTIC_JS.contains("function _markUserAction()"));
-        assert!(
-            super::DIAGNOSTIC_JS.contains("window.addEventListener(name, _markUserAction, true)")
-        );
-        assert!(super::DIAGNOSTIC_JS.contains("function _shouldRecordRequest(startedAtMs)"));
-        assert!(
-            super::DIAGNOSTIC_JS
-                .contains("var shouldRecordRequest = _shouldRecordRequest(requestStartedAtMs)"),
-            "fetch 必须按请求开始时间判断是否由用户操作触发"
-        );
-        assert!(
-            super::DIAGNOSTIC_JS.contains("this.__diag.shouldRecordRequest"),
-            "XHR 必须按 send 时刻判断是否由用户操作触发"
-        );
-        assert!(
-            super::DIAGNOSTIC_JS.contains("_shouldRecordRequest(startedAt)"),
-            "performance fallback 不能把后台轮询重新捞回快照"
-        );
-    }
-
-    #[test]
-    fn diagnostic_script_keeps_reset_capture_armed_across_navigation() {
-        assert!(super::DIAGNOSTIC_JS.contains("_captureStorageKey"));
-        assert!(super::DIAGNOSTIC_JS.contains("function _readStoredCaptureSession()"));
-        assert!(
-            super::DIAGNOSTIC_JS.contains("var _storedSession = _readStoredCaptureSession()")
-        );
-        assert!(
-            super::DIAGNOSTIC_JS
-                .contains("window.__diag_capture_armed = !!(_storedSession")
-        );
-        assert!(super::DIAGNOSTIC_JS.contains("sessionStorage.setItem(_captureStorageKey"));
     }
 
     #[test]
@@ -990,25 +716,6 @@ mod tests {
             store.data.lock().unwrap().as_deref(),
             Some(r#"{"pageUrl":"http://host","requests":[]}"#)
         );
-    }
-
-    #[test]
-    fn captured_store_keeps_non_empty_payload_when_late_empty_snapshot_arrives() {
-        let store = super::CapturedDataStore::default();
-
-        store
-            .store_data(
-                r#"{"pageUrl":"http://host","requests":[{"method":"GET","url":"http://host/gateway/pcm/a","status":200,"durationMs":10,"timestamp":"2026-06-30T00:00:00Z"}]}"#
-                    .to_string(),
-            )
-            .unwrap();
-        store
-            .store_data(r#"{"pageUrl":"http://host","requests":[]}"#.to_string())
-            .unwrap();
-
-        let stored = store.data.lock().unwrap().clone().unwrap();
-        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
-        assert_eq!(value["requests"].as_array().unwrap().len(), 1);
     }
 }
 

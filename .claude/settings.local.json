@@ -34,7 +34,16 @@
       "Bash(kill %1)",
       "Bash(pkill -f \"cargo tauri dev\")",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git ls-remote *)",
+      "Bash(gh run *)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sI --max-time 8 https://github.com)",
+      "Bash(/tmp/check_js)",
+      "Bash(node --check /tmp/redirect.js)"
     ]
   }
 }

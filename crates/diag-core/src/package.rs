@@ -846,6 +846,24 @@ fn is_key_log(entry: &LogEntry) -> bool {
         || msg.contains("==> Preparing:")
         || msg.contains("==> Parameters:")
         || msg.contains("<==      Total:")
+        || message_contains_sql(msg)
+}
+
+/// 判断日志正文是否携带 SQL —— 覆盖医院侧 PGSqlInterceptor 格式
+/// （`[PGSqlInterceptor]转换之后sql:SELECT ...` / `转换之前sql:...`）以及裸 SQL 行。
+/// 这些行是关联 SQL/EXPLAIN 的关键证据，必须计入“关键日志”一并展示，否则会像
+/// 一条 traceId 明明有 3 条日志、报告却只显示 1 条 RequestUrl 那样丢失 SQL 信息。
+fn message_contains_sql(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("sql:") {
+        return true;
+    }
+    let has_verb = ["select ", "insert ", "update ", "delete "]
+        .iter()
+        .any(|verb| lower.contains(verb));
+    let has_clause =
+        lower.contains(" from ") || lower.contains(" into ") || lower.contains(" set ");
+    has_verb && has_clause
 }
 
 fn sort_log_refs(mut logs: Vec<&LogEntry>) -> Vec<&LogEntry> {
@@ -1554,4 +1572,42 @@ fn format_log_line(entry: &LogEntry) -> String {
         "[{}] [{}] [{}] [{}] [{}] {}",
         time, entry.level, trace_id, entry.service, thread, entry.message
     )
+}
+
+#[cfg(test)]
+mod key_log_tests {
+    use super::is_key_log;
+    use crate::models::LogEntry;
+
+    fn info_log(message: &str) -> LogEntry {
+        LogEntry {
+            time: Some("2026-07-01T01:53:16.427Z".to_string()),
+            level: "INFO".to_string(),
+            service: "pcm-statistics".to_string(),
+            trace_id: Some("ef6091010efe49c59e7435d3798d3cbd".to_string()),
+            thread: None,
+            class: None,
+            method: None,
+            message: message.to_string(),
+            exception: None,
+            stack_trace: None,
+            raw: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn hospital_pgsql_interceptor_logs_count_as_key_logs() {
+        // 医院 PGSqlInterceptor 的 SQL 日志（INFO 级）必须计入关键日志，
+        // 否则同一 traceId 的 3 条日志里两条 SQL 会被丢弃，只剩 RequestUrl。
+        assert!(is_key_log(&info_log(
+            "[PGSqlInterceptor]转换之后sql:SELECT count(0) FROM tb_name_list WHERE TYPE = ? AND NAME LIKE CONCAT('%', ?, '%')"
+        )));
+        assert!(is_key_log(&info_log(
+            "[PGSqlInterceptor]转换之前sql:SELECT count(0) FROM `tb_name_list` WHERE `TYPE` = ?"
+        )));
+        // RequestUrl 仍然是关键日志。
+        assert!(is_key_log(&info_log("RequestUrl:[/v1/pt/needMaskData]")));
+        // 普通业务 INFO 日志不应被误判为关键日志。
+        assert!(!is_key_log(&info_log("用户登录成功，返回首页")));
+    }
 }

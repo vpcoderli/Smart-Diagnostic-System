@@ -75,10 +75,16 @@ fn request_matches_gateway_prefix(raw_url: &str, gateway_prefix: &str) -> bool {
         return true;
     }
 
-    let Ok(url) = url::Url::parse(raw_url) else {
-        return false;
+    // 兼容绝对 URL 与相对 URL：url::Url::parse 只认绝对地址，浏览器拦截到的多为
+    // 相对地址（/gateway/...），若直接判 false 会把带 traceId 的真实请求过滤掉。
+    let path = match url::Url::parse(raw_url) {
+        Ok(url) => url.path().to_string(),
+        Err(_) => raw_url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(raw_url)
+            .to_string(),
     };
-    let path = url.path();
     path == prefix || path.starts_with(&format!("{}/", prefix))
 }
 
@@ -86,9 +92,15 @@ fn filter_captured_page_to_gateway_scope(
     mut captured: CapturedPage,
     gateway_prefix: &str,
 ) -> CapturedPage {
-    captured
-        .requests
-        .retain(|request| request_matches_gateway_prefix(&request.url, gateway_prefix));
+    captured.requests.retain(|request| {
+        // 带 x-trace 的请求一律保留（数量不能少，用于 x0 检索日志）；
+        // 仅对无 traceId 的历史/兜底条目再按网关前缀裁剪。
+        let has_trace = request
+            .trace_id
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        has_trace || request_matches_gateway_prefix(&request.url, gateway_prefix)
+    });
     captured
 }
 
@@ -96,24 +108,38 @@ fn summarize_captured_services(
     captured: &CapturedPage,
     gateway_prefix: &str,
 ) -> Vec<serde_json::Value> {
-    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut trace_ids_by_service = std::collections::BTreeMap::<String, std::collections::HashSet<String>>::new();
+    let mut request_counts = std::collections::HashMap::<String, usize>::new();
+
     for request in &captured.requests {
         if !request_matches_gateway_prefix(&request.url, gateway_prefix) {
             continue;
         }
         if let Ok(resolved) = url_resolver::resolve_url(&request.url, gateway_prefix) {
             if !resolved.service.is_empty() && resolved.service != "unknown" {
-                *counts.entry(resolved.service).or_default() += 1;
+                *request_counts.entry(resolved.service.clone()).or_default() += 1;
+                if let Some(ref tid) = request.trace_id {
+                    let trimmed = tid.trim();
+                    if !trimmed.is_empty() && trimmed != "null" {
+                        trace_ids_by_service
+                            .entry(resolved.service)
+                            .or_default()
+                            .insert(trimmed.to_string());
+                    }
+                }
             }
         }
     }
 
-    counts
+    trace_ids_by_service
         .into_iter()
-        .map(|(name, request_count)| {
+        .map(|(name, tids)| {
+            let req_count = request_counts.get(&name).cloned().unwrap_or(0);
             serde_json::json!({
                 "name": name,
-                "requestCount": request_count,
+                "requestCount": tids.len(), // 唯一 traceId 数映射到 requestCount 字段兼容老 UI
+                "totalRequests": req_count,
+                "traceIdCount": tids.len(),
             })
         })
         .collect()
@@ -684,6 +710,8 @@ pub fn reset_capture_data(
                         window.__diag_frame_requests = {};
                         window.__diag_frame_pages = {};
                         window.__diag_page_url = location.href;
+                        window.__diag_gesture_until = 0;
+                        window.__diag_gesture_marks = [];
                         try { performance.clearResourceTimings(); } catch(e) {}
                         if (document && document.title) {
                             document.title = document.title
@@ -2558,19 +2586,23 @@ mod tests {
         let captured = CapturedPage {
             page_url: "http://host/app".to_string(),
             requests: vec![
-                request("http://host/gateway/pcm-management/api/a"),
-                request("http://host/gateway/pcm-management/api/b"),
-                request("http://host/gateway/user-center/login"),
-                request("http://host/not-gateway/static"),
+                request_with_trace("http://host/gateway/pcm-management/api/a", Some("trace-1")),
+                request_with_trace("http://host/gateway/pcm-management/api/b", Some("trace-2")),
+                request_with_trace("http://host/gateway/pcm-management/api/c", Some("trace-1")), // 重复 traceId
+                request_with_trace("http://host/gateway/pcm-management/api/d", None), // 无 traceId
+                request_with_trace("http://host/gateway/user-center/login", Some("trace-3")),
+                request_with_trace("http://host/not-gateway/static", Some("trace-4")),
             ],
         };
 
         let services = summarize_captured_services(&captured, "/gateway");
 
         assert_eq!(services[0]["name"], "pcm-management");
-        assert_eq!(services[0]["requestCount"], 2);
+        assert_eq!(services[0]["requestCount"], 2); // 唯一 traceId 个数 (trace-1, trace-2)
+        assert_eq!(services[0]["totalRequests"], 4); // 总请求个数 (a, b, c, d)
         assert_eq!(services[1]["name"], "user-center");
-        assert_eq!(services[1]["requestCount"], 1);
+        assert_eq!(services[1]["requestCount"], 1); // 唯一 traceId 个数 (trace-3)
+        assert_eq!(services[1]["totalRequests"], 1); // 总请求个数 (login)
         assert_eq!(services.len(), 2);
     }
 
@@ -2579,9 +2611,9 @@ mod tests {
         let captured = CapturedPage {
             page_url: "http://host/app".to_string(),
             requests: vec![
-                request("http://host/gateway/pcm-management/api/a"),
-                request("http://host/not-gateway/static"),
-                request("http://host/gateway/user-center/login"),
+                request_with_trace("http://host/gateway/pcm-management/api/a", None),
+                request_with_trace("http://host/not-gateway/static", None),
+                request_with_trace("http://host/gateway/user-center/login", None),
             ],
         };
 
@@ -2594,13 +2626,38 @@ mod tests {
             .all(|req| req.url.contains("/gateway/")));
     }
 
-    fn request(url: &str) -> CapturedRequest {
+    #[test]
+    fn filter_captured_page_keeps_relative_gateway_urls() {
+        // 浏览器 hook 拦截到的多为相对地址；旧实现用 url::Url::parse 判定，相对 URL 解析失败
+        // 会被整体过滤掉，导致带 traceId 的真实请求丢失、报告里只剩空 trace 的 Performance 兜底条目。
+        let captured = CapturedPage {
+            page_url: "http://host/app".to_string(),
+            requests: vec![
+                request_with_trace(
+                    "/gateway/pcm-management/v1/pt/dept/list?pageNum=1",
+                    Some("c7439cb95e03425d85fb28fe32447f3d"),
+                ),
+                request_with_trace("/not-gateway/static/x.png", None),
+            ],
+        };
+
+        let filtered = filter_captured_page_to_gateway_scope(captured, "/gateway");
+
+        assert_eq!(filtered.requests.len(), 1, "相对网关 URL 必须被保留");
+        assert_eq!(
+            filtered.requests[0].trace_id.as_deref(),
+            Some("c7439cb95e03425d85fb28fe32447f3d"),
+            "保留的请求必须带上原始 traceId"
+        );
+    }
+
+    fn request_with_trace(url: &str, trace_id: Option<&str>) -> CapturedRequest {
         CapturedRequest {
             method: "GET".to_string(),
             url: url.to_string(),
             status: 200,
             duration_ms: 10,
-            trace_id: None,
+            trace_id: trace_id.map(|s| s.to_string()),
             timestamp: "2026-06-30T00:00:00Z".to_string(),
             request_type: "xhr".to_string(),
             response_size: None,
